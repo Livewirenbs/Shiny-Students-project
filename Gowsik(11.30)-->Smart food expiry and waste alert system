@@ -1,0 +1,1108 @@
+name : gowsik
+Title: Smart food expiry and waste alert system
+python code:
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import mysql.connector
+from mysql.connector import Error
+from datetime import datetime, date, timedelta
+import winsound
+from plyer import notification
+import subprocess
+import threading
+
+
+# ==========================================================
+# 1. MYSQL CONFIGURATION
+# ==========================================================
+
+MYSQL_HOST = "localhost"
+MYSQL_PORT = 3307
+MYSQL_USER = "root"
+MYSQL_PASSWORD = "ChooseYourNewPassword123!"
+DATABASE_NAME = "expire_date"
+
+CHECK_INTERVAL = 60_000       # 60 seconds
+ALERT_DAYS = 3                # Alert when 3 days or less remain
+MAX_ALERTS_PER_DAY = 2
+SECOND_ALERT_GAP_HOURS = 6
+
+
+# ==========================================================
+# 2. DATABASE FUNCTIONS
+# ==========================================================
+
+def get_connection(include_database=True):
+    """Create a fresh MySQL connection for each database operation."""
+    settings = {
+        "host": MYSQL_HOST,
+        "port": MYSQL_PORT,
+        "user": MYSQL_USER,
+        "password": MYSQL_PASSWORD,
+        "connection_timeout": 5
+    }
+
+    if include_database:
+        settings["database"] = DATABASE_NAME
+
+    return mysql.connector.connect(**settings)
+
+
+def initialize_database():
+    """Create the database and table if they do not already exist."""
+    server_connection = None
+    database_connection = None
+    server_cursor = None
+    database_cursor = None
+
+    try:
+        server_connection = get_connection(include_database=False)
+        server_cursor = server_connection.cursor()
+        server_cursor.execute(
+            f"CREATE DATABASE IF NOT EXISTS `{DATABASE_NAME}`"
+        )
+        server_connection.commit()
+
+        database_connection = get_connection(include_database=True)
+        database_cursor = database_connection.cursor()
+
+        database_cursor.execute("""
+            CREATE TABLE IF NOT EXISTS food_items (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                quantity VARCHAR(50) NOT NULL,
+                expiry_date DATE NOT NULL,
+                status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+                alert_date DATE DEFAULT NULL,
+                alert_count INT NOT NULL DEFAULT 0,
+                last_alert_time DATETIME DEFAULT NULL
+            )
+        """)
+
+        # Add missing columns if this table was created by an older version.
+        database_cursor.execute("SHOW COLUMNS FROM food_items")
+        existing_columns = {row[0] for row in database_cursor.fetchall()}
+
+        migrations = {
+            "status": (
+                "ALTER TABLE food_items "
+                "ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE'"
+            ),
+            "alert_date": (
+                "ALTER TABLE food_items ADD COLUMN alert_date DATE DEFAULT NULL"
+            ),
+            "alert_count": (
+                "ALTER TABLE food_items "
+                "ADD COLUMN alert_count INT NOT NULL DEFAULT 0"
+            ),
+            "last_alert_time": (
+                "ALTER TABLE food_items "
+                "ADD COLUMN last_alert_time DATETIME DEFAULT NULL"
+            )
+        }
+
+        for column_name, sql in migrations.items():
+            if column_name not in existing_columns:
+                database_cursor.execute(sql)
+
+        database_connection.commit()
+        print(
+            f"MySQL connected successfully. "
+            f"Database: {DATABASE_NAME}, Port: {MYSQL_PORT}"
+        )
+
+    finally:
+        if server_cursor:
+            server_cursor.close()
+        if server_connection and server_connection.is_connected():
+            server_connection.close()
+
+        if database_cursor:
+            database_cursor.close()
+        if database_connection and database_connection.is_connected():
+            database_connection.close()
+
+
+def database_query(sql, values=None, fetch="none"):
+    """
+    Run a database operation using its own connection.
+    fetch: 'one', 'all', or 'none'.
+    """
+    connection = None
+    cursor = None
+
+    try:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(sql, values or ())
+
+        if fetch == "one":
+            result = cursor.fetchone()
+        elif fetch == "all":
+            result = cursor.fetchall()
+        else:
+            result = cursor.rowcount
+
+        connection.commit()
+        return result
+
+    except Error:
+        if connection and connection.is_connected():
+            connection.rollback()
+        raise
+
+    finally:
+        if cursor:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+
+
+# ==========================================================
+# 3. ALERT FUNCTIONS
+# ==========================================================
+
+def voice_alert(message):
+    """Speak an alert using Windows PowerShell speech synthesis."""
+    try:
+        safe_message = message.replace("'", "''")
+
+        script = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$speaker = New-Object "
+            "System.Speech.Synthesis.SpeechSynthesizer; "
+            f"$speaker.Speak('{safe_message}'); "
+            "$speaker.Dispose()"
+        )
+
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=25,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+
+    except Exception as error:
+        print("Voice alert error:", error)
+
+
+def alert_message(message):
+    """Play sound, show desktop notification and speak without freezing Tkinter."""
+    try:
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        winsound.Beep(1000, 500)
+    except Exception as error:
+        print("Sound alert error:", error)
+
+    try:
+        notification.notify(
+            title="Smart Food Expiry Alert",
+            message=message,
+            timeout=15
+        )
+    except Exception as error:
+        print("Desktop notification error:", error)
+
+    # Run speech in a background thread so the GUI remains responsive.
+    threading.Thread(
+        target=voice_alert,
+        args=(message,),
+        daemon=True
+    ).start()
+
+
+# ==========================================================
+# 4. MAIN APPLICATION
+# ==========================================================
+
+class SmartFoodExpiryApp:
+
+    def __init__(self, window):
+        self.root = window
+        self.root.title("Smart Food Expiry & Waste Alert System")
+        self.root.geometry("1120x760")
+        self.root.minsize(950, 650)
+        self.root.configure(bg="#F1F5F4")
+
+        self.closing = False
+        self.monitor_job = None
+
+        self.create_styles()
+        self.create_widgets()
+        self.refresh_products()
+        self.update_dashboard()
+
+        # First expiry check after the window is ready.
+        self.root.after(1500, self.automatic_check)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.close_application)
+
+    # ------------------------------------------------------
+    # 5. GUI DESIGN
+    # ------------------------------------------------------
+
+    def create_styles(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(
+            "Treeview",
+            rowheight=30,
+            font=("Arial", 10),
+            background="white",
+            fieldbackground="white"
+        )
+        style.configure(
+            "Treeview.Heading",
+            font=("Arial", 10, "bold"),
+            background="#DCEBE4",
+            foreground="#174D3B"
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", "#B8DDCA")],
+            foreground=[("selected", "#123D2D")]
+        )
+
+    def create_widgets(self):
+        header = tk.Frame(self.root, bg="#176B50", height=75)
+        header.pack(fill="x")
+
+        tk.Label(
+            header,
+            text="SMART FOOD EXPIRY & WASTE ALERT SYSTEM",
+            font=("Arial", 20, "bold"),
+            bg="#176B50",
+            fg="white"
+        ).pack(pady=20)
+
+        # Dashboard summary
+        dashboard = tk.Frame(self.root, bg="#F1F5F4")
+        dashboard.pack(fill="x", padx=20, pady=(15, 5))
+
+        self.active_label = self.make_stat_card(
+            dashboard, "ACTIVE PRODUCTS", "0", 0
+        )
+        self.expiring_label = self.make_stat_card(
+            dashboard, "EXPIRING SOON", "0", 1
+        )
+        self.wasted_label = self.make_stat_card(
+            dashboard, "WASTED PRODUCTS", "0", 2
+        )
+
+        # Product input section
+        input_frame = tk.LabelFrame(
+            self.root,
+            text=" Add Food Product ",
+            font=("Arial", 11, "bold"),
+            bg="#F1F5F4",
+            fg="#176B50",
+            padx=12,
+            pady=10
+        )
+        input_frame.pack(fill="x", padx=20, pady=10)
+
+        tk.Label(
+            input_frame, text="Food Name:",
+            bg="#F1F5F4", font=("Arial", 10)
+        ).grid(row=0, column=0, padx=8, pady=8, sticky="w")
+
+        self.name_entry = tk.Entry(input_frame, width=25, font=("Arial", 10))
+        self.name_entry.grid(row=0, column=1, padx=8, pady=8)
+
+        tk.Label(
+            input_frame, text="Quantity:",
+            bg="#F1F5F4", font=("Arial", 10)
+        ).grid(row=0, column=2, padx=8, pady=8, sticky="w")
+
+        self.quantity_entry = tk.Entry(
+            input_frame, width=18, font=("Arial", 10)
+        )
+        self.quantity_entry.grid(row=0, column=3, padx=8, pady=8)
+
+        tk.Label(
+            input_frame, text="Expiry Date:",
+            bg="#F1F5F4", font=("Arial", 10)
+        ).grid(row=0, column=4, padx=8, pady=8, sticky="w")
+
+        self.expiry_entry = tk.Entry(
+            input_frame, width=18, font=("Arial", 10)
+        )
+        self.expiry_entry.grid(row=0, column=5, padx=8, pady=8)
+
+        tk.Label(
+            input_frame,
+            text="DD-MM-YYYY",
+            bg="#F1F5F4",
+            fg="gray"
+        ).grid(row=1, column=5, sticky="w", padx=8)
+
+        self.make_button(
+            input_frame, "SAVE PRODUCT",
+            self.add_product, 1, 1, color="#176B50"
+        )
+
+        # Search section
+        search_frame = tk.Frame(self.root, bg="#F1F5F4")
+        search_frame.pack(fill="x", padx=20, pady=8)
+
+        tk.Label(
+            search_frame, text="Search Product:",
+            bg="#F1F5F4", font=("Arial", 10, "bold")
+        ).pack(side="left", padx=(0, 8))
+
+        self.search_entry = tk.Entry(
+            search_frame, width=30, font=("Arial", 10)
+        )
+        self.search_entry.pack(side="left", padx=5)
+        self.search_entry.bind("<Return>", lambda event: self.search_product())
+
+        self.make_button(
+            search_frame, "SEARCH",
+            self.search_product, color="#176B50"
+        ).pack(side="left", padx=5)
+
+        self.make_button(
+            search_frame, "SHOW ALL",
+            self.show_all, color="#477B68"
+        ).pack(side="left", padx=5)
+
+        # Product table
+        table_frame = tk.Frame(self.root, bg="#F1F5F4")
+        table_frame.pack(fill="both", expand=True, padx=20, pady=8)
+
+        columns = ("ID", "Name", "Quantity", "Expiry Date", "Days Left")
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            height=11
+        )
+
+        widths = {
+            "ID": 65,
+            "Name": 300,
+            "Quantity": 150,
+            "Expiry Date": 180,
+            "Days Left": 130
+        }
+
+        for column in columns:
+            self.tree.heading(column, text=column)
+            self.tree.column(
+                column,
+                width=widths[column],
+                anchor="center"
+            )
+
+        self.tree.tag_configure("expired", foreground="#C62828")
+        self.tree.tag_configure("soon", foreground="#B26A00")
+        self.tree.tag_configure("normal", foreground="#245B43")
+
+        scrollbar = ttk.Scrollbar(
+            table_frame,
+            orient="vertical",
+            command=self.tree.yview
+        )
+        self.tree.configure(yscrollcommand=scrollbar.set)
+
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Action buttons
+        button_frame = tk.Frame(self.root, bg="#F1F5F4")
+        button_frame.pack(fill="x", padx=16, pady=(8, 15))
+
+        actions = [
+            ("VIEW PRODUCTS", self.refresh_products),
+            ("CHECK EXPIRY", self.manual_expiry_check),
+            ("RECORD WASTE", self.record_waste),
+            ("WASTE REPORT", self.waste_report),
+            ("DELETE WASTE", self.delete_waste),
+            ("DELETE PRODUCT", self.delete_product)
+        ]
+
+        for label, command in actions:
+            self.make_button(
+                button_frame, label, command,
+                color="#176B50"
+            ).pack(side="left", padx=4, expand=True)
+
+        self.status_label = tk.Label(
+            self.root,
+            text="Database connected | Automatic monitoring enabled",
+            bg="#E1EEE7",
+            fg="#176B50",
+            anchor="w",
+            padx=12,
+            font=("Arial", 9)
+        )
+        self.status_label.pack(fill="x", side="bottom")
+
+    def make_stat_card(self, parent, title, value, column):
+        card = tk.Frame(
+            parent,
+            bg="white",
+            highlightbackground="#D6E5DC",
+            highlightthickness=1,
+            padx=15,
+            pady=9
+        )
+        card.grid(row=0, column=column, padx=6, sticky="ew")
+        parent.grid_columnconfigure(column, weight=1)
+
+        tk.Label(
+            card, text=title,
+            font=("Arial", 9, "bold"),
+            bg="white", fg="#60756A"
+        ).pack()
+
+        value_label = tk.Label(
+            card, text=value,
+            font=("Arial", 19, "bold"),
+            bg="white", fg="#176B50"
+        )
+        value_label.pack(pady=(3, 0))
+        return value_label
+
+    def make_button(
+        self, parent, text, command,
+        row=None, column=None, color="#176B50"
+    ):
+        button = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=color,
+            fg="white",
+            activebackground="#0F503A",
+            activeforeground="white",
+            font=("Arial", 9, "bold"),
+            relief="flat",
+            cursor="hand2",
+            padx=10,
+            pady=8
+        )
+        if row is not None and column is not None:
+            button.grid(row=row, column=column, padx=8, pady=8)
+        return button
+
+    # ------------------------------------------------------
+    # 6. DASHBOARD
+    # ------------------------------------------------------
+
+    def update_dashboard(self):
+        try:
+            active = database_query(
+                "SELECT COUNT(*) FROM food_items WHERE status='ACTIVE'",
+                fetch="one"
+            )[0]
+
+            wasted = database_query(
+                "SELECT COUNT(*) FROM food_items WHERE status='WASTED'",
+                fetch="one"
+            )[0]
+
+            expiring = database_query("""
+                SELECT COUNT(*)
+                FROM food_items
+                WHERE status='ACTIVE'
+                AND DATEDIFF(expiry_date, CURDATE()) BETWEEN 0 AND %s
+            """, (ALERT_DAYS,), fetch="one")[0]
+
+            self.active_label.config(text=str(active))
+            self.expiring_label.config(text=str(expiring))
+            self.wasted_label.config(text=str(wasted))
+
+        except Error as error:
+            self.set_status(f"Dashboard database error: {error}")
+
+    def set_status(self, message):
+        self.status_label.config(text=message)
+
+    # ------------------------------------------------------
+    # 7. ADD PRODUCT
+    # ------------------------------------------------------
+
+    def add_product(self):
+        name = self.name_entry.get().strip()
+        quantity = self.quantity_entry.get().strip()
+        expiry_text = self.expiry_entry.get().strip()
+
+        if not name or not quantity or not expiry_text:
+            messagebox.showwarning(
+                "Missing Details",
+                "Please enter food name, quantity and expiry date."
+            )
+            return
+
+        if not quantity.isdigit() or int(quantity) <= 0:
+            messagebox.showerror(
+                "Invalid Quantity",
+                "Quantity must be a positive whole number."
+            )
+            return
+
+        if len(name) > 100:
+            messagebox.showerror(
+                "Invalid Name",
+                "Food name cannot exceed 100 characters."
+            )
+            return
+
+        try:
+            expiry = datetime.strptime(
+                expiry_text, "%d-%m-%Y"
+            ).date()
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Date",
+                "Enter the date in DD-MM-YYYY format."
+            )
+            return
+
+        if expiry < date.today():
+            messagebox.showerror(
+                "Invalid Date",
+                "Expiry date cannot be earlier than today."
+            )
+            return
+
+        try:
+            duplicate = database_query("""
+                SELECT id
+                FROM food_items
+                WHERE LOWER(name)=LOWER(%s)
+                AND expiry_date=%s
+                AND status='ACTIVE'
+                LIMIT 1
+            """, (name, expiry), fetch="one")
+
+            if duplicate:
+                messagebox.showwarning(
+                    "Duplicate Product",
+                    "This active product with the same expiry date already exists."
+                )
+                return
+
+            database_query("""
+                INSERT INTO food_items
+                    (name, quantity, expiry_date, status)
+                VALUES (%s, %s, %s, 'ACTIVE')
+            """, (name, quantity, expiry))
+
+            self.name_entry.delete(0, tk.END)
+            self.quantity_entry.delete(0, tk.END)
+            self.expiry_entry.delete(0, tk.END)
+
+            self.refresh_products()
+            self.update_dashboard()
+            self.set_status(f"{name} was saved successfully.")
+
+            messagebox.showinfo(
+                "Success",
+                "Food product saved successfully."
+            )
+
+            self.check_all_expiry()
+
+        except Error as error:
+            messagebox.showerror("Database Error", str(error))
+
+    # ------------------------------------------------------
+    # 8. VIEW AND SEARCH PRODUCTS
+    # ------------------------------------------------------
+
+    def refresh_products(self):
+        self.load_products()
+
+    def load_products(self, search_text=""):
+        try:
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+
+            if search_text:
+                rows = database_query("""
+                    SELECT id, name, quantity, expiry_date,
+                           DATEDIFF(expiry_date, CURDATE()) AS days_left
+                    FROM food_items
+                    WHERE status='ACTIVE'
+                    AND LOWER(name) LIKE LOWER(%s)
+                    ORDER BY expiry_date ASC
+                """, ("%" + search_text + "%",), fetch="all")
+            else:
+                rows = database_query("""
+                    SELECT id, name, quantity, expiry_date,
+                           DATEDIFF(expiry_date, CURDATE()) AS days_left
+                    FROM food_items
+                    WHERE status='ACTIVE'
+                    ORDER BY expiry_date ASC
+                """, fetch="all")
+
+            for row in rows:
+                days_left = row[4]
+
+                if days_left < 0:
+                    tag = "expired"
+                    days_text = f"Expired ({abs(days_left)} days)"
+                elif days_left <= ALERT_DAYS:
+                    tag = "soon"
+                    days_text = str(days_left)
+                else:
+                    tag = "normal"
+                    days_text = str(days_left)
+
+                self.tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3].strftime("%d-%m-%Y"),
+                        days_text
+                    ),
+                    tags=(tag,)
+                )
+
+            self.set_status(f"Showing {len(rows)} active product(s).")
+            self.update_dashboard()
+
+        except Error as error:
+            messagebox.showerror("Database Error", str(error))
+
+    def search_product(self):
+        search_text = self.search_entry.get().strip()
+
+        if not search_text:
+            messagebox.showwarning(
+                "Search",
+                "Enter a product name to search."
+            )
+            return
+
+        self.load_products(search_text)
+
+        if not self.tree.get_children():
+            messagebox.showinfo("Search", "No matching product found.")
+
+    def show_all(self):
+        self.search_entry.delete(0, tk.END)
+        self.refresh_products()
+
+    # ------------------------------------------------------
+    # 9. EXPIRY MONITORING AND ALERT HISTORY
+    # ------------------------------------------------------
+
+    def check_one_product(self, item):
+        product_id, name, expiry, alert_date, alert_count, last_time = item
+
+        today = date.today()
+        days_left = (expiry - today).days
+
+        if days_left > ALERT_DAYS:
+            return
+
+        if days_left == 3:
+            message = f"{name} expires in 3 days!"
+        elif days_left == 2:
+            message = f"{name} expires in 2 days!"
+        elif days_left == 1:
+            message = f"{name} expires tomorrow!"
+        elif days_left == 0:
+            message = f"{name} expires today!"
+        else:
+            message = f"{name} expiry date has passed!"
+
+        if alert_date != today:
+            alert_count = 0
+            last_time = None
+
+        if alert_count >= MAX_ALERTS_PER_DAY:
+            return
+
+        if alert_count == 1 and last_time:
+            if datetime.now() - last_time < timedelta(
+                hours=SECOND_ALERT_GAP_HOURS
+            ):
+                return
+
+        # Save the alert history before sending the alert.
+        # This prevents duplicate alerts if the app checks again.
+        try:
+            database_query("""
+                UPDATE food_items
+                SET alert_date=%s,
+                    alert_count=%s,
+                    last_alert_time=%s
+                WHERE id=%s
+            """, (
+                today,
+                alert_count + 1,
+                datetime.now(),
+                product_id
+            ))
+
+            alert_message(message)
+            self.set_status(f"Expiry alert sent: {message}")
+
+        except Error as error:
+            print("Could not save alert history:", error)
+
+    def check_all_expiry(self):
+        try:
+            products = database_query("""
+                SELECT id, name, expiry_date,
+                       alert_date, alert_count, last_alert_time
+                FROM food_items
+                WHERE status='ACTIVE'
+            """, fetch="all")
+
+            for item in products:
+                self.check_one_product(item)
+
+            self.update_dashboard()
+            self.refresh_table_without_dashboard()
+
+        except Error as error:
+            self.set_status(f"Expiry check failed: {error}")
+
+    def refresh_table_without_dashboard(self):
+        # Refresh table but avoid repeatedly opening message boxes.
+        try:
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+
+            rows = database_query("""
+                SELECT id, name, quantity, expiry_date,
+                       DATEDIFF(expiry_date, CURDATE())
+                FROM food_items
+                WHERE status='ACTIVE'
+                ORDER BY expiry_date ASC
+            """, fetch="all")
+
+            for row in rows:
+                days_left = row[4]
+
+                if days_left < 0:
+                    tag = "expired"
+                    days_text = f"Expired ({abs(days_left)} days)"
+                elif days_left <= ALERT_DAYS:
+                    tag = "soon"
+                    days_text = str(days_left)
+                else:
+                    tag = "normal"
+                    days_text = str(days_left)
+
+                self.tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3].strftime("%d-%m-%Y"),
+                        days_text
+                    ),
+                    tags=(tag,)
+                )
+        except Error as error:
+            print("Table refresh error:", error)
+
+    def manual_expiry_check(self):
+        self.check_all_expiry()
+        messagebox.showinfo(
+            "Expiry Check",
+            "Expiry monitoring completed."
+        )
+
+    def automatic_check(self):
+        if self.closing:
+            return
+
+        self.check_all_expiry()
+        self.monitor_job = self.root.after(
+            CHECK_INTERVAL,
+            self.automatic_check
+        )
+
+    # ------------------------------------------------------
+    # 10. SELECTED PRODUCT
+    # ------------------------------------------------------
+
+    def selected_product_id(self):
+        selected = self.tree.selection()
+
+        if not selected:
+            messagebox.showwarning(
+                "Selection Required",
+                "Please select a product from the table."
+            )
+            return None
+
+        values = self.tree.item(selected[0], "values")
+        return int(values[0])
+
+    # ------------------------------------------------------
+    # 11. DELETE PRODUCT
+    # ------------------------------------------------------
+
+    def delete_product(self):
+        product_id = self.selected_product_id()
+
+        if product_id is None:
+            return
+
+        confirm = messagebox.askyesno(
+            "Confirm Delete",
+            "Do you want to permanently delete this product?"
+        )
+
+        if not confirm:
+            return
+
+        try:
+            database_query(
+                "DELETE FROM food_items WHERE id=%s",
+                (product_id,)
+            )
+            self.refresh_products()
+            messagebox.showinfo(
+                "Deleted",
+                "Product deleted successfully."
+            )
+        except Error as error:
+            messagebox.showerror("Delete Error", str(error))
+
+    # ------------------------------------------------------
+    # 12. RECORD FOOD WASTE
+    # ------------------------------------------------------
+
+    def record_waste(self):
+        product_id = self.selected_product_id()
+
+        if product_id is None:
+            return
+
+        try:
+            product = database_query("""
+                SELECT name
+                FROM food_items
+                WHERE id=%s AND status='ACTIVE'
+            """, (product_id,), fetch="one")
+
+            if not product:
+                messagebox.showwarning(
+                    "Not Found",
+                    "The selected active product was not found."
+                )
+                return
+
+            product_name = product[0]
+
+            confirm = messagebox.askyesno(
+                "Record Waste",
+                f"Record '{product_name}' as wasted?"
+            )
+
+            if not confirm:
+                return
+
+            database_query("""
+                UPDATE food_items
+                SET status='WASTED'
+                WHERE id=%s AND status='ACTIVE'
+            """, (product_id,))
+
+            self.refresh_products()
+
+            messagebox.showinfo(
+                "Success",
+                "Food waste recorded successfully."
+            )
+
+        except Error as error:
+            messagebox.showerror("Waste Error", str(error))
+
+    # ------------------------------------------------------
+    # 13. WASTE REPORT
+    # ------------------------------------------------------
+
+    def waste_report(self):
+        try:
+            rows = database_query("""
+                SELECT id, name, quantity, expiry_date
+                FROM food_items
+                WHERE status='WASTED'
+                ORDER BY id DESC
+            """, fetch="all")
+
+        except Error as error:
+            messagebox.showerror("Report Error", str(error))
+            return
+
+        report = tk.Toplevel(self.root)
+        report.title("Food Waste Report")
+        report.geometry("720x430")
+        report.configure(bg="#F1F5F4")
+
+        tk.Label(
+            report,
+            text="FOOD WASTE REPORT",
+            font=("Arial", 18, "bold"),
+            bg="#F1F5F4",
+            fg="#176B50"
+        ).pack(pady=12)
+
+        tk.Label(
+            report,
+            text=f"Total Wasted Products: {len(rows)}",
+            font=("Arial", 11, "bold"),
+            bg="#F1F5F4"
+        ).pack(pady=5)
+
+        columns = ("ID", "Name", "Quantity", "Expiry Date")
+        report_tree = ttk.Treeview(
+            report,
+            columns=columns,
+            show="headings"
+        )
+
+        for column in columns:
+            report_tree.heading(column, text=column)
+            report_tree.column(column, width=160, anchor="center")
+
+        report_tree.pack(
+            fill="both",
+            expand=True,
+            padx=15,
+            pady=12
+        )
+
+        for row in rows:
+            report_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3].strftime("%d-%m-%Y")
+                )
+            )
+
+        if not rows:
+            tk.Label(
+                report,
+                text="No food waste has been recorded.",
+                bg="#F1F5F4",
+                font=("Arial", 11)
+            ).pack(pady=10)
+
+    # ------------------------------------------------------
+    # 14. DELETE WASTE RECORDS
+    # ------------------------------------------------------
+
+    def delete_waste(self):
+        confirm = messagebox.askyesno(
+            "Confirm Delete",
+            "Permanently delete ALL food waste records?"
+        )
+
+        if not confirm:
+            return
+
+        try:
+            deleted = database_query("""
+                DELETE FROM food_items
+                WHERE status='WASTED'
+            """)
+
+            self.refresh_products()
+            messagebox.showinfo(
+                "Success",
+                f"{deleted} waste record(s) deleted."
+            )
+
+        except Error as error:
+            messagebox.showerror("Delete Error", str(error))
+
+    # ------------------------------------------------------
+    # 15. CLOSE APPLICATION
+    # ------------------------------------------------------
+
+    def close_application(self):
+        self.closing = True
+
+        if self.monitor_job is not None:
+            try:
+                self.root.after_cancel(self.monitor_job)
+            except tk.TclError:
+                pass
+
+        self.root.destroy()
+
+
+# ==========================================================
+# 16. START APPLICATION
+# ==========================================================
+
+if __name__ == "__main__":
+
+    try:
+        initialize_database()
+
+    except Error as error:
+        print("MySQL Database Connection Failed:", error)
+
+        error_root = tk.Tk()
+        error_root.withdraw()
+
+        messagebox.showerror(
+            "MySQL Connection Failed",
+            "Cannot connect to MySQL.\n\n"
+            "Check these settings:\n"
+            "1. MySQL80 service is running.\n"
+            "2. Port is 3307.\n"
+            "3. Root password is correct.\n\n"
+            f"Details: {error}"
+        )
+
+        error_root.destroy()
+        raise SystemExit
+
+    app_root = tk.Tk()
+    application = SmartFoodExpiryApp(app_root)
+    app_root.mainloop()
+
+
+path = Path("/mnt/data/smart_food_expiry_complete.py")
+path.write_text(code, encoding="utf-8")
+print(f"Created: {path}\nLines: {len(code.splitlines())}")
+
+
+
+SQL Code :
+
+
+CREATE DATABASE expire_date;
+
+USE expire_date;
+
+CREATE TABLE food_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    quantity VARCHAR(50) NOT NULL,
+    expiry_date DATE NOT NULL,
+    status VARCHAR(20) DEFAULT 'ACTIVE',
+    alert_date DATE,
+    alert_count INT DEFAULT 0,
+    last_alert_time DATETIME
+);
+
+select * from food_items
