@@ -1,0 +1,918 @@
+Python Code : 
+import csv
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from datetime import datetime
+
+import mysql.connector
+from mysql.connector import Error
+
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+
+# -------------------- EDIT YOUR MYSQL DETAILS HERE --------------------
+MYSQL_CONFIG = {
+    "host": "localhost",
+    "port": 3307,
+    "user": "root",
+    "password": "ChooseYourNewPassword123!",
+}
+DATABASE_NAME = "crime_analytics"
+REFRESH_INTERVAL_MS = 5000
+# ----------------------------------------------------------------------
+
+
+class CrimeDatabase:
+    """Handles MySQL connection and database operations."""
+
+    def server_connection(self):
+        return mysql.connector.connect(**MYSQL_CONFIG)
+
+    def database_connection(self):
+        settings = dict(MYSQL_CONFIG)
+        settings["database"] = DATABASE_NAME
+        return mysql.connector.connect(**settings)
+
+    def setup_database(self):
+        conn = self.server_connection()
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"CREATE DATABASE IF NOT EXISTS `{DATABASE_NAME}` "
+                    "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                )
+            finally:
+                cursor.close()
+        finally:
+            conn.close()
+
+        conn = self.database_connection()
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS crimes (
+                        crime_id INT AUTO_INCREMENT PRIMARY KEY,
+                        crime_type VARCHAR(100) NOT NULL,
+                        description TEXT,
+                        location VARCHAR(200) NOT NULL,
+                        incident_date DATETIME NOT NULL,
+                        status ENUM(
+                            'Pending',
+                            'Under Investigation',
+                            'Solved',
+                            'Closed'
+                        ) NOT NULL DEFAULT 'Pending',
+                        severity ENUM(
+                            'Low', 'Medium', 'High', 'Critical'
+                        ) NOT NULL DEFAULT 'Medium',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                            ON UPDATE CURRENT_TIMESTAMP,
+                        INDEX idx_incident_date (incident_date),
+                        INDEX idx_location (location),
+                        INDEX idx_status (status),
+                        INDEX idx_crime_type (crime_type)
+                    )
+                """)
+                conn.commit()
+            finally:
+                cursor.close()
+        finally:
+            conn.close()
+
+    def fetch_all(self, sql, params=()):
+        conn = self.database_connection()
+        try:
+            cursor = conn.cursor(dictionary=True)
+            try:
+                cursor.execute(sql, params)
+                return cursor.fetchall()
+            finally:
+                cursor.close()
+        finally:
+            conn.close()
+
+    def execute(self, sql, params=()):
+        conn = self.database_connection()
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(sql, params)
+                conn.commit()
+                return cursor.lastrowid
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                cursor.close()
+        finally:
+            conn.close()
+
+    def dashboard_stats(self):
+        rows = self.fetch_all("""
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(DATE(incident_date) = CURDATE()), 0) AS today,
+                COALESCE(SUM(status = 'Solved'), 0) AS solved,
+                COALESCE(SUM(status IN
+                    ('Pending', 'Under Investigation')), 0) AS pending
+            FROM crimes
+        """)
+        return rows[0]
+
+    def get_crimes(self, search_text=""):
+        term = "%" + search_text + "%"
+        # IMPORTANT: Double every % in DATE_FORMAT. The MySQL connector
+        # uses %s-style parameter substitution for this parameterized query.
+        return self.fetch_all("""
+            SELECT crime_id, crime_type, location,
+                   DATE_FORMAT(incident_date, '%Y-%m-%d %H:%i:%S')
+                       AS incident_date,
+                   status, severity, description
+            FROM crimes
+            WHERE crime_type LIKE %s
+               OR location LIKE %s
+               OR status LIKE %s
+               OR CAST(crime_id AS CHAR) LIKE %s
+            ORDER BY incident_date DESC
+        """, (term, term, term, term))
+
+    def get_type_summary(self):
+        return self.fetch_all("""
+            SELECT crime_type, COUNT(*) AS total
+            FROM crimes
+            GROUP BY crime_type
+            ORDER BY total DESC
+            LIMIT 8
+        """)
+
+    def get_area_summary(self):
+        return self.fetch_all("""
+            SELECT location, COUNT(*) AS total
+            FROM crimes
+            GROUP BY location
+            ORDER BY total DESC
+            LIMIT 8
+        """)
+
+
+class CrimeAnalyticsApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Real-Time Crime Analytics System")
+        self.root.geometry("1180x750")
+        self.root.minsize(950, 620)
+        self.root.configure(bg="#edf2f7")
+
+        self.db = CrimeDatabase()
+        # Create the database and table if they do not already exist.
+        self.db.setup_database()
+        self.record_descriptions = {}
+        self.chart_canvas = None
+        self.refresh_job = None
+
+        self.configure_style()
+        self.build_interface()
+        self.refresh_all(show_errors=True)
+        self.schedule_refresh()
+
+    def configure_style(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("Treeview", rowheight=27, font=("Arial", 10))
+        style.configure(
+            "Treeview.Heading", font=("Arial", 10, "bold")
+        )
+        style.configure(
+            "TNotebook.Tab",
+            padding=(14, 8),
+            font=("Arial", 10, "bold")
+        )
+
+    def build_interface(self):
+        header = tk.Frame(self.root, bg="#142d4e", height=75)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+
+        tk.Label(
+            header,
+            text="REAL-TIME CRIME ANALYTICS",
+            bg="#142d4e",
+            fg="white",
+            font=("Arial", 20, "bold")
+        ).pack(side="left", padx=22, pady=18)
+
+        self.connection_label = tk.Label(
+            header,
+            text="● Checking MySQL...",
+            bg="#142d4e",
+            fg="#ffd166",
+            font=("Arial", 10, "bold")
+        )
+        self.connection_label.pack(side="right", padx=22)
+
+        self.tabs = ttk.Notebook(self.root)
+        self.tabs.pack(fill="both", expand=True, padx=14, pady=14)
+
+        self.dashboard_tab = tk.Frame(self.tabs, bg="#edf2f7")
+        self.records_tab = tk.Frame(self.tabs, bg="#edf2f7")
+        self.register_tab = tk.Frame(self.tabs, bg="#edf2f7")
+        self.analytics_tab = tk.Frame(self.tabs, bg="#edf2f7")
+
+        self.tabs.add(self.dashboard_tab, text="Dashboard")
+        self.tabs.add(self.records_tab, text="Crime Records")
+        self.tabs.add(self.register_tab, text="Register Crime")
+        self.tabs.add(self.analytics_tab, text="Analytics")
+
+        self.build_dashboard()
+        self.build_records()
+        self.build_register_form()
+        self.build_analytics()
+
+    def make_stat_card(self, parent, title, color):
+        card = tk.Frame(
+            parent,
+            bg="white",
+            highlightbackground="#d8e1ec",
+            highlightthickness=1
+        )
+        tk.Label(
+            card,
+            text=title,
+            bg="white",
+            fg="#617187",
+            font=("Arial", 10, "bold")
+        ).pack(anchor="w", padx=14, pady=(13, 3))
+
+        value = tk.Label(
+            card,
+            text="0",
+            bg="white",
+            fg=color,
+            font=("Arial", 25, "bold")
+        )
+        value.pack(anchor="w", padx=14, pady=(0, 12))
+        return card, value
+
+    def build_dashboard(self):
+        tk.Label(
+            self.dashboard_tab,
+            text="Crime Overview",
+            bg="#edf2f7",
+            fg="#142d4e",
+            font=("Arial", 19, "bold")
+        ).pack(anchor="w", padx=18, pady=(16, 8))
+
+        cards = tk.Frame(self.dashboard_tab, bg="#edf2f7")
+        cards.pack(fill="x", padx=12)
+
+        self.stat_labels = []
+        card_data = [
+            ("Total Crimes", "#1769aa"),
+            ("Reported Today", "#d97706"),
+            ("Solved Cases", "#16835d"),
+            ("Pending / Investigating", "#c2413b"),
+        ]
+
+        for index, (title, color) in enumerate(card_data):
+            card, value = self.make_stat_card(cards, title, color)
+            card.grid(row=0, column=index, padx=6, pady=6, sticky="nsew")
+            cards.grid_columnconfigure(index, weight=1)
+            self.stat_labels.append(value)
+
+        lower = tk.Frame(self.dashboard_tab, bg="#edf2f7")
+        lower.pack(fill="both", expand=True, padx=18, pady=14)
+
+        tk.Label(
+            lower,
+            text="Latest Crime Records",
+            bg="#edf2f7",
+            fg="#142d4e",
+            font=("Arial", 13, "bold")
+        ).pack(anchor="w")
+
+        columns = ("id", "type", "location", "date", "status", "severity")
+        self.recent_tree = ttk.Treeview(
+            lower, columns=columns, show="headings", height=11
+        )
+
+        headings = {
+            "id": "ID",
+            "type": "Crime Type",
+            "location": "Location",
+            "date": "Incident Date",
+            "status": "Status",
+            "severity": "Severity",
+        }
+        widths = {
+            "id": 55,
+            "type": 155,
+            "location": 190,
+            "date": 160,
+            "status": 160,
+            "severity": 100,
+        }
+
+        for col in columns:
+            self.recent_tree.heading(col, text=headings[col])
+            self.recent_tree.column(
+                col, width=widths[col], anchor="center"
+            )
+
+        self.recent_tree.pack(fill="both", expand=True, pady=8)
+
+        tk.Label(
+            lower,
+            text="Automatic database refresh: every 5 seconds",
+            bg="#edf2f7",
+            fg="#65758b",
+            font=("Arial", 9)
+        ).pack(anchor="e")
+
+    def build_records(self):
+        toolbar = tk.Frame(self.records_tab, bg="#edf2f7")
+        toolbar.pack(fill="x", padx=14, pady=12)
+
+        tk.Label(
+            toolbar,
+            text="Search:",
+            bg="#edf2f7",
+            font=("Arial", 10, "bold")
+        ).pack(side="left")
+
+        self.search_var = tk.StringVar()
+        ttk.Entry(
+            toolbar, textvariable=self.search_var, width=28
+        ).pack(side="left", padx=7)
+
+        ttk.Button(
+            toolbar, text="Search", command=self.refresh_records
+        ).pack(side="left")
+        ttk.Button(
+            toolbar, text="Show All", command=self.clear_search
+        ).pack(side="left", padx=5)
+        ttk.Button(
+            toolbar, text="Update Status", command=self.update_status
+        ).pack(side="right", padx=5)
+        ttk.Button(
+            toolbar, text="Delete Selected", command=self.delete_selected
+        ).pack(side="right", padx=5)
+        ttk.Button(
+            toolbar, text="Export CSV", command=self.export_csv
+        ).pack(side="right", padx=5)
+
+        columns = ("id", "type", "location", "date", "status", "severity")
+        self.records_tree = ttk.Treeview(
+            self.records_tab, columns=columns, show="headings"
+        )
+
+        labels = [
+            "ID", "Crime Type", "Location",
+            "Incident Date", "Status", "Severity"
+        ]
+        widths = [55, 165, 220, 170, 170, 110]
+
+        for col, label, width in zip(columns, labels, widths):
+            self.records_tree.heading(col, text=label)
+            self.records_tree.column(
+                col, width=width, anchor="center"
+            )
+
+        self.records_tree.pack(
+            fill="both", expand=True, padx=14, pady=(0, 8)
+        )
+        self.records_tree.bind(
+            "<<TreeviewSelect>>", self.show_selected_description
+        )
+
+        self.description_label = tk.Label(
+            self.records_tab,
+            text="Select a record to view its description.",
+            bg="#edf2f7",
+            fg="#52647a",
+            anchor="w",
+            justify="left",
+            wraplength=1000
+        )
+        self.description_label.pack(
+            fill="x", padx=16, pady=(0, 10)
+        )
+
+    def build_register_form(self):
+        form = tk.Frame(
+            self.register_tab,
+            bg="white",
+            padx=24,
+            pady=18,
+            highlightbackground="#d8e1ec",
+            highlightthickness=1
+        )
+        form.pack(fill="x", padx=28, pady=22)
+
+        tk.Label(
+            form,
+            text="Register a Crime Incident",
+            bg="white",
+            fg="#142d4e",
+            font=("Arial", 17, "bold")
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
+        self.type_var = tk.StringVar()
+        self.location_var = tk.StringVar()
+        self.date_var = tk.StringVar(
+            value=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+        self.status_var = tk.StringVar(value="Pending")
+        self.severity_var = tk.StringVar(value="Medium")
+
+        fields = [
+            (
+                "Crime Type *",
+                ttk.Combobox(
+                    form,
+                    textvariable=self.type_var,
+                    values=[
+                        "Theft", "Robbery", "Assault", "Burglary",
+                        "Cybercrime", "Fraud", "Vandalism",
+                        "Traffic Violation", "Other"
+                    ],
+                    width=42
+                )
+            ),
+            (
+                "Location / Area *",
+                ttk.Entry(form, textvariable=self.location_var, width=45)
+            ),
+            (
+                "Incident Date * (YYYY-MM-DD HH:MM:SS)",
+                ttk.Entry(form, textvariable=self.date_var, width=45)
+            ),
+            (
+                "Case Status",
+                ttk.Combobox(
+                    form,
+                    textvariable=self.status_var,
+                    values=[
+                        "Pending", "Under Investigation", "Solved", "Closed"
+                    ],
+                    state="readonly",
+                    width=42
+                )
+            ),
+            (
+                "Severity",
+                ttk.Combobox(
+                    form,
+                    textvariable=self.severity_var,
+                    values=["Low", "Medium", "High", "Critical"],
+                    state="readonly",
+                    width=42
+                )
+            ),
+        ]
+
+        for row, (label, widget) in enumerate(fields, start=1):
+            tk.Label(
+                form,
+                text=label,
+                bg="white",
+                fg="#34465d",
+                font=("Arial", 10, "bold")
+            ).grid(row=row, column=0, sticky="w", pady=7)
+            widget.grid(row=row, column=1, sticky="w", pady=7)
+
+        tk.Label(
+            form,
+            text="Description",
+            bg="white",
+            fg="#34465d",
+            font=("Arial", 10, "bold")
+        ).grid(row=6, column=0, sticky="nw", pady=7)
+
+        self.description_text = tk.Text(
+            form, height=5, width=55, font=("Arial", 10)
+        )
+        self.description_text.grid(
+            row=6, column=1, sticky="w", pady=7
+        )
+
+        ttk.Button(
+            form,
+            text="Save Crime Record",
+            command=self.save_crime
+        ).grid(row=7, column=1, sticky="w", pady=15)
+
+        tk.Label(
+            form,
+            text="* Required fields. Enter verified incident information only.",
+            bg="white",
+            fg="#65758b",
+            font=("Arial", 9)
+        ).grid(row=8, column=0, columnspan=2, sticky="w")
+
+    def build_analytics(self):
+        tk.Label(
+            self.analytics_tab,
+            text="Crime Pattern Analysis",
+            bg="#edf2f7",
+            fg="#142d4e",
+            font=("Arial", 19, "bold")
+        ).pack(anchor="w", padx=18, pady=14)
+
+        self.chart_frame = tk.Frame(self.analytics_tab, bg="white")
+        self.chart_frame.pack(
+            fill="both", expand=True, padx=16, pady=(0, 14)
+        )
+
+    def save_crime(self):
+        crime_type = self.type_var.get().strip()
+        location = self.location_var.get().strip()
+        date_text = self.date_var.get().strip()
+
+        if not crime_type or not location or not date_text:
+            messagebox.showwarning(
+                "Missing Information",
+                "Enter crime type, location and incident date."
+            )
+            return
+
+        try:
+            datetime.strptime(date_text, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Date",
+                "Enter date as YYYY-MM-DD HH:MM:SS."
+            )
+            return
+
+        description = self.description_text.get("1.0", "end").strip()
+
+        try:
+            self.db.execute("""
+                INSERT INTO crimes
+                (crime_type, description, location, incident_date, status, severity)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                crime_type,
+                description,
+                location,
+                date_text,
+                self.status_var.get(),
+                self.severity_var.get()
+            ))
+
+            messagebox.showinfo(
+                "Saved", "Crime record saved successfully."
+            )
+
+            self.type_var.set("")
+            self.location_var.set("")
+            self.date_var.set(
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+            self.status_var.set("Pending")
+            self.severity_var.set("Medium")
+            self.description_text.delete("1.0", "end")
+            self.refresh_all()
+        except Error as exc:
+            self.database_error(exc)
+
+    def refresh_records(self):
+        rows = self.db.get_crimes(self.search_var.get().strip())
+        self.records_tree.delete(*self.records_tree.get_children())
+        self.record_descriptions = {}
+
+        for row in rows:
+            record_id = str(row["crime_id"])
+            self.records_tree.insert(
+                "", "end", iid=record_id,
+                values=(
+                    row["crime_id"],
+                    row["crime_type"],
+                    row["location"],
+                    row["incident_date"],
+                    row["status"],
+                    row["severity"]
+                )
+            )
+            self.record_descriptions[record_id] = (
+                row.get("description") or "(No description)"
+            )
+
+    def clear_search(self):
+        self.search_var.set("")
+        self.refresh_records()
+
+    def show_selected_description(self, _event=None):
+        selected = self.records_tree.selection()
+        if selected:
+            description = self.record_descriptions.get(
+                selected[0], "(No description)"
+            )
+            self.description_label.config(
+                text="Description: " + description
+            )
+
+    def selected_id(self):
+        selected = self.records_tree.selection()
+        if not selected:
+            messagebox.showwarning(
+                "Select Record", "Select a crime record first."
+            )
+            return None
+        return int(selected[0])
+
+    def update_status(self):
+        crime_id = self.selected_id()
+        if crime_id is None:
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Update Case Status")
+        dialog.geometry("320x160")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(
+            dialog,
+            text="Choose new case status:",
+            font=("Arial", 11, "bold")
+        ).pack(pady=14)
+
+        status = tk.StringVar(value="Under Investigation")
+        ttk.Combobox(
+            dialog,
+            textvariable=status,
+            values=[
+                "Pending", "Under Investigation", "Solved", "Closed"
+            ],
+            state="readonly",
+            width=25
+        ).pack(pady=5)
+
+        def save_status():
+            try:
+                self.db.execute(
+                    "UPDATE crimes SET status=%s WHERE crime_id=%s",
+                    (status.get(), crime_id)
+                )
+                dialog.destroy()
+                self.refresh_all()
+            except Error as exc:
+                messagebox.showerror(
+                    "Database Error", str(exc), parent=dialog
+                )
+
+        ttk.Button(
+            dialog, text="Save Status", command=save_status
+        ).pack(pady=12)
+
+    def delete_selected(self):
+        crime_id = self.selected_id()
+        if crime_id is None:
+            return
+
+        confirmed = messagebox.askyesno(
+            "Confirm Delete",
+            f"Delete crime record #{crime_id}? This cannot be undone."
+        )
+        if not confirmed:
+            return
+
+        try:
+            self.db.execute(
+                "DELETE FROM crimes WHERE crime_id=%s",
+                (crime_id,)
+            )
+            self.refresh_all()
+        except Error as exc:
+            self.database_error(exc)
+
+    def export_csv(self):
+        try:
+            rows = self.db.get_crimes(self.search_var.get().strip())
+            if not rows:
+                messagebox.showinfo(
+                    "Export", "There are no records to export."
+                )
+                return
+
+            path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv")],
+                initialfile="crime_records.csv"
+            )
+            if not path:
+                return
+
+            with open(
+                path, "w", newline="", encoding="utf-8-sig"
+            ) as output_file:
+                writer = csv.DictWriter(
+                    output_file, fieldnames=list(rows[0].keys())
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+
+            messagebox.showinfo(
+                "Export Complete", "CSV file exported successfully."
+            )
+        except (Error, OSError) as exc:
+            messagebox.showerror("Export Error", str(exc))
+
+    def refresh_dashboard(self):
+        stats = self.db.dashboard_stats()
+        values = [
+            stats.get("total") or 0,
+            stats.get("today") or 0,
+            stats.get("solved") or 0,
+            stats.get("pending") or 0,
+        ]
+
+        for label, value in zip(self.stat_labels, values):
+            label.config(text=str(value))
+
+        # Uppercase %S represents seconds and avoids a %s parameter token.
+        rows = self.db.fetch_all("""
+            SELECT crime_id, crime_type, location,
+                   DATE_FORMAT(incident_date, '%Y-%m-%d %H:%i:%S')
+                       AS incident_date,
+                   status, severity
+            FROM crimes
+            ORDER BY incident_date DESC
+            LIMIT 10
+        """)
+
+        self.recent_tree.delete(*self.recent_tree.get_children())
+        for row in rows:
+            self.recent_tree.insert(
+                "", "end",
+                values=(
+                    row["crime_id"],
+                    row["crime_type"],
+                    row["location"],
+                    row["incident_date"],
+                    row["status"],
+                    row["severity"]
+                )
+            )
+
+    def refresh_analytics(self):
+        type_rows = self.db.get_type_summary()
+        area_rows = self.db.get_area_summary()
+
+        if self.chart_canvas is not None:
+            self.chart_canvas.get_tk_widget().destroy()
+            self.chart_canvas = None
+
+        figure = Figure(figsize=(10, 4.8), dpi=100)
+        type_axis = figure.add_subplot(121)
+        area_axis = figure.add_subplot(122)
+
+        if type_rows:
+            names = [row["crime_type"] for row in type_rows]
+            counts = [int(row["total"]) for row in type_rows]
+            type_axis.bar(names, counts)
+            type_axis.set_title("Crimes by Type")
+            type_axis.set_ylabel("Number of Cases")
+            type_axis.tick_params(axis="x", rotation=35, labelsize=8)
+        else:
+            type_axis.text(
+                0.5, 0.5, "No crime data available",
+                ha="center", va="center"
+            )
+            type_axis.set_title("Crimes by Type")
+            type_axis.set_axis_off()
+
+        if area_rows:
+            areas = [row["location"] for row in area_rows][::-1]
+            counts = [int(row["total"]) for row in area_rows][::-1]
+            area_axis.barh(areas, counts)
+            area_axis.set_title("Top Crime Locations")
+            area_axis.set_xlabel("Number of Cases")
+            area_axis.tick_params(axis="y", labelsize=8)
+        else:
+            area_axis.text(
+                0.5, 0.5, "No crime data available",
+                ha="center", va="center"
+            )
+            area_axis.set_title("Top Crime Locations")
+            area_axis.set_axis_off()
+
+        figure.tight_layout()
+        self.chart_canvas = FigureCanvasTkAgg(
+            figure, master=self.chart_frame
+        )
+        self.chart_canvas.draw()
+        self.chart_canvas.get_tk_widget().pack(
+            fill="both", expand=True
+        )
+
+    def refresh_all(self, show_errors=False):
+        try:
+            self.refresh_dashboard()
+            self.refresh_records()
+            self.refresh_analytics()
+            self.connection_label.config(
+                text="● MySQL Connected", fg="#7ee0ad"
+            )
+        except Error as exc:
+            self.connection_label.config(
+                text="● MySQL Disconnected", fg="#ff8b8b"
+            )
+            if show_errors:
+                self.database_error(exc)
+
+    def database_error(self, exc):
+        self.connection_label.config(
+            text="● MySQL Disconnected", fg="#ff8b8b"
+        )
+        messagebox.showerror(
+            "MySQL Error",
+            f"{exc}\n\nCheck that MySQL Server is running and that "
+            "MYSQL_CONFIG contains the correct username and password."
+        )
+
+    def schedule_refresh(self):
+        self.refresh_job = self.root.after(
+            REFRESH_INTERVAL_MS, self.periodic_refresh
+        )
+
+    def periodic_refresh(self):
+        try:
+            self.refresh_dashboard()
+            self.refresh_records()
+            self.refresh_analytics()
+            self.connection_label.config(
+                text="● MySQL Connected", fg="#7ee0ad"
+            )
+        except Error:
+            self.connection_label.config(
+                text="● MySQL Disconnected", fg="#ff8b8b"
+            )
+        finally:
+            if self.root.winfo_exists():
+                self.schedule_refresh()
+
+    def close(self):
+        if self.refresh_job is not None:
+            try:
+                self.root.after_cancel(self.refresh_job)
+            except tk.TclError:
+                pass
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+
+    try:
+        app = CrimeAnalyticsApp(root)
+        root.protocol("WM_DELETE_WINDOW", app.close)
+        root.mainloop()
+    except Error as exc:
+        messagebox.showerror(
+            "Startup / MySQL Error",
+            f"{exc}\n\nVerify MYSQL_CONFIG at the top of this Python file."
+        )
+        root.destroy()
+    except Exception as exc:
+        messagebox.showerror("Application Error", str(exc))
+        root.destroy()
+
+Data Base Code : 
+CREATE DATABASE crime_analytics;
+
+USE crime_analytics;
+
+CREATE TABLE crimes (
+    crime_id INT AUTO_INCREMENT PRIMARY KEY,
+    crime_type VARCHAR(100) NOT NULL,
+    description TEXT,
+    location VARCHAR(200) NOT NULL,
+    incident_date DATETIME NOT NULL,
+
+    status ENUM(
+        'Pending',
+        'Under Investigation',
+        'Solved',
+        'Closed'
+    ) DEFAULT 'Pending',
+
+    severity ENUM(
+        'Low',
+        'Medium',
+        'High',
+        'Critical'
+    ) DEFAULT 'Medium',
+
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ON UPDATE CURRENT_TIMESTAMP
+);
