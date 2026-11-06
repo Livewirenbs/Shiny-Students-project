@@ -1,0 +1,708 @@
+Name:sumithra.c
+
+Title:RakshaTN-digital child safety, missing persons and crime reporting system..
+_______________________
+________________________
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import mysql.connector
+from mysql.connector import Error
+import hashlib
+import hmac
+from datetime import datetime
+
+# ==================================================
+# 1. MYSQL DATABASE CONNECTION
+# ==================================================
+
+MYSQL_HOST = "localhost"
+MYSQL_USER = "root"
+MYSQL_PASSWORD = "sumithra`"  # Replace with your MySQL password
+DATABASE_NAME = "rakshatn_db"
+
+
+def connect_database():
+    """Create the database if it does not exist, then connect to it."""
+    server = None
+
+    try:
+        server = mysql.connector.connect(
+            host=MYSQL_HOST,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD
+        )
+
+        server_cursor = server.cursor()
+        server_cursor.execute(
+            f"CREATE DATABASE IF NOT EXISTS {DATABASE_NAME}"
+        )
+        server_cursor.close()
+        server.close()
+        server = None
+
+        connection = mysql.connector.connect(
+            host=MYSQL_HOST,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=DATABASE_NAME
+        )
+
+        return connection
+
+    except Error as error:
+        if server is not None and server.is_connected():
+            server.close()
+        raise RuntimeError(
+            "Could not connect to MySQL. Check that MySQL Server is running "
+            "and that your username and password are correct.\n\n"
+            + str(error)
+        )
+
+
+try:
+    conn = connect_database()
+    cursor = conn.cursor(buffered=True)
+except (Error, RuntimeError) as error:
+    print("DATABASE CONNECTION ERROR:")
+    print(error)
+    raise SystemExit(1)
+
+
+# ==================================================
+# 2. CREATE DATABASE TABLES
+# ==================================================
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS reports (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    category VARCHAR(100) NOT NULL,
+    subject VARCHAR(150) NOT NULL,
+    age VARCHAR(20),
+    location VARCHAR(255) NOT NULL,
+    incident_date VARCHAR(20),
+    description TEXT NOT NULL,
+    status VARCHAR(100) NOT NULL,
+    officer_update TEXT,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS officers (
+    username VARCHAR(100) PRIMARY KEY,
+    password_hash VARCHAR(255) NOT NULL
+)
+""")
+
+conn.commit()
+
+
+# ==================================================
+# 3. PASSWORD HASHING AND DEMO OFFICER ACCOUNT
+# ==================================================
+
+def hash_password(password):
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        b"RakshaTN_fixed_salt_2026",
+        100000
+    ).hex()
+
+
+# Same behaviour as your second code:
+# The demo officer password is reset when the program starts.
+cursor.execute("""
+INSERT INTO officers (username, password_hash)
+VALUES (%s, %s)
+ON DUPLICATE KEY UPDATE password_hash = VALUES(password_hash)
+""", ("officer", hash_password("Officer@123")))
+
+conn.commit()
+
+
+# ==================================================
+# 4. NOTIFICATION SOUND
+# ==================================================
+
+def play_beep():
+    try:
+        import winsound
+        winsound.MessageBeep()
+    except Exception:
+        try:
+            root.bell()
+        except Exception:
+            pass
+
+
+# ==================================================
+# 5. MAIN WINDOW
+# ==================================================
+
+root = tk.Tk()
+root.title("RakshaTN - Public Safety System")
+root.geometry("850x700")
+root.configure(bg="#edf2f7")
+
+title = tk.Label(
+    root,
+    text="RAKSHATN",
+    font=("Arial", 25, "bold"),
+    bg="#edf2f7",
+    fg="#17365d"
+)
+title.pack(pady=(15, 2))
+
+subtitle = tk.Label(
+    root,
+    text="Child Safety and Crime Reporting System",
+    font=("Arial", 12),
+    bg="#edf2f7"
+)
+subtitle.pack(pady=(0, 15))
+
+
+# ==================================================
+# 6. CITIZEN REPORT FORM
+# ==================================================
+
+form = tk.LabelFrame(
+    root,
+    text="Submit a Crime or Safety Report",
+    font=("Arial", 12, "bold"),
+    padx=15,
+    pady=12,
+    bg="white"
+)
+form.pack(fill="x", padx=25, pady=5)
+
+tk.Label(form, text="Report Category", bg="white").grid(
+    row=0, column=0, sticky="w", pady=6
+)
+
+category_box = ttk.Combobox(
+    form,
+    values=[
+        "Child Safety",
+        "Murder",
+        "Kidnapping",
+        "Missing Person",
+        "Domestic Violence",
+        "Harassment",
+        "Theft",
+        "Other Crime"
+    ],
+    state="readonly",
+    width=28
+)
+category_box.grid(row=0, column=1, sticky="w", pady=6)
+category_box.set("Child Safety")
+
+tk.Label(form, text="Subject / Person Name", bg="white").grid(
+    row=1, column=0, sticky="w", pady=6
+)
+subject_entry = tk.Entry(form, width=32)
+subject_entry.grid(row=1, column=1, sticky="w", pady=6)
+
+tk.Label(form, text="Age (if known)", bg="white").grid(
+    row=2, column=0, sticky="w", pady=6
+)
+age_entry = tk.Entry(form, width=32)
+age_entry.grid(row=2, column=1, sticky="w", pady=6)
+
+tk.Label(form, text="Incident Location", bg="white").grid(
+    row=3, column=0, sticky="w", pady=6
+)
+location_entry = tk.Entry(form, width=32)
+location_entry.grid(row=3, column=1, sticky="w", pady=6)
+
+tk.Label(form, text="Incident Date", bg="white").grid(
+    row=4, column=0, sticky="w", pady=6
+)
+date_entry = tk.Entry(form, width=32)
+date_entry.grid(row=4, column=1, sticky="w", pady=6)
+date_entry.insert(0, datetime.now().strftime("%Y-%m-%d"))
+
+tk.Label(form, text="Incident Description", bg="white").grid(
+    row=5, column=0, sticky="nw", pady=6
+)
+description_text = tk.Text(form, width=32, height=5)
+description_text.grid(row=5, column=1, sticky="w", pady=6)
+
+
+# ==================================================
+# 7. SUBMIT REPORT
+# ==================================================
+
+def submit_report():
+    category = category_box.get()
+    subject = subject_entry.get().strip()
+    age = age_entry.get().strip()
+    location = location_entry.get().strip()
+    incident_date = date_entry.get().strip()
+    description = description_text.get("1.0", tk.END).strip()
+
+    if not subject or not location or not description:
+        messagebox.showwarning(
+            "Missing Information",
+            "Please enter the subject, location and description."
+        )
+        return
+
+    current_time = datetime.now()
+
+    try:
+        cursor.execute("""
+        INSERT INTO reports (
+            category, subject, age, location,
+            incident_date, description, status,
+            officer_update, created_at, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            category,
+            subject,
+            age,
+            location,
+            incident_date,
+            description,
+            "Pending",
+            "Waiting for officer review",
+            current_time,
+            current_time
+        ))
+
+        conn.commit()
+        report_id = cursor.lastrowid
+
+        play_beep()
+
+        messagebox.showinfo(
+            "Report Submitted",
+            f"Your report was submitted successfully!\n\n"
+            f"Your Report ID is: {report_id}\n\n"
+            "Please save this ID to check your report status."
+        )
+
+        subject_entry.delete(0, tk.END)
+        age_entry.delete(0, tk.END)
+        location_entry.delete(0, tk.END)
+        description_text.delete("1.0", tk.END)
+
+    except Error as error:
+        conn.rollback()
+        messagebox.showerror("Database Error", str(error))
+
+
+tk.Button(
+    form,
+    text="SUBMIT REPORT",
+    command=submit_report,
+    bg="#176b45",
+    fg="white",
+    font=("Arial", 11, "bold"),
+    width=22
+).grid(row=6, column=1, sticky="w", pady=12)
+
+
+# ==================================================
+# 8. CITIZEN REPORT TRACKING
+# ==================================================
+
+tracking = tk.LabelFrame(
+    root,
+    text="Check Your Report Status",
+    font=("Arial", 12, "bold"),
+    padx=15,
+    pady=12,
+    bg="white"
+)
+tracking.pack(fill="x", padx=25, pady=10)
+
+tk.Label(tracking, text="Enter Report ID:", bg="white").grid(
+    row=0, column=0, sticky="w"
+)
+
+report_id_entry = tk.Entry(tracking, width=20)
+report_id_entry.grid(row=0, column=1, padx=8)
+
+status_result = tk.Label(
+    tracking,
+    text="Your report status will appear here.",
+    bg="white",
+    fg="#17365d",
+    justify="left",
+    wraplength=600
+)
+status_result.grid(row=1, column=0, columnspan=3, sticky="w", pady=10)
+
+
+def check_report_status():
+    report_id = report_id_entry.get().strip()
+
+    if not report_id.isdigit():
+        messagebox.showwarning("Invalid ID", "Enter a valid Report ID.")
+        return
+
+    try:
+        cursor.execute("""
+        SELECT category, status, officer_update, updated_at
+        FROM reports
+        WHERE id = %s
+        """, (int(report_id),))
+
+        report = cursor.fetchone()
+
+        if report:
+            category, status, officer_update, updated_at = report
+
+            status_result.config(
+                text=(
+                    f"Report ID: {report_id}\n"
+                    f"Category: {category}\n"
+                    f"Current Status: {status}\n"
+                    f"Officer Update: {officer_update}\n"
+                    f"Last Updated: {updated_at}"
+                )
+            )
+        else:
+            status_result.config(text="No report found with this ID.")
+
+    except Error as error:
+        messagebox.showerror("Database Error", str(error))
+
+
+tk.Button(
+    tracking,
+    text="CHECK STATUS",
+    command=check_report_status,
+    bg="#176b9b",
+    fg="white"
+).grid(row=0, column=2, padx=8)
+
+
+# ==================================================
+# 9. OFFICER LOGIN
+# ==================================================
+
+def open_officer_login():
+    login_window = tk.Toplevel(root)
+    login_window.title("Officer Login")
+    login_window.geometry("350x250")
+    login_window.resizable(False, False)
+
+    tk.Label(
+        login_window,
+        text="OFFICER LOGIN",
+        font=("Arial", 17, "bold")
+    ).pack(pady=15)
+
+    tk.Label(login_window, text="Username").pack()
+    username_entry = tk.Entry(login_window, width=28)
+    username_entry.pack(pady=5)
+
+    tk.Label(login_window, text="Password").pack()
+    password_entry = tk.Entry(login_window, width=28, show="*")
+    password_entry.pack(pady=5)
+
+    def check_login():
+        username = username_entry.get().strip()
+        password = password_entry.get()
+
+        try:
+            cursor.execute(
+                "SELECT password_hash FROM officers WHERE username = %s",
+                (username,)
+            )
+            result = cursor.fetchone()
+
+            if result and hmac.compare_digest(
+                result[0],
+                hash_password(password)
+            ):
+                messagebox.showinfo("Success", "Officer Login Successful!")
+                login_window.destroy()
+                open_officer_dashboard()
+            else:
+                messagebox.showerror("Error", "Invalid Username or Password")
+
+        except Error as error:
+            messagebox.showerror("Database Error", str(error))
+
+    tk.Button(
+        login_window,
+        text="LOGIN",
+        command=check_login,
+        bg="#17365d",
+        fg="white",
+        width=18
+    ).pack(pady=15)
+
+
+# ==================================================
+# 10. OFFICER DASHBOARD
+# ==================================================
+
+def open_officer_dashboard():
+    dashboard = tk.Toplevel(root)
+    dashboard.title("RakshaTN - Officer Dashboard")
+    dashboard.geometry("1100x650")
+
+    tk.Label(
+        dashboard,
+        text="OFFICER DASHBOARD",
+        font=("Arial", 20, "bold"),
+        fg="#17365d"
+    ).pack(pady=12)
+
+    columns = (
+        "ID", "Category", "Subject", "Location",
+        "Status", "Created"
+    )
+
+    table = ttk.Treeview(
+        dashboard,
+        columns=columns,
+        show="headings",
+        height=12
+    )
+
+    for column in columns:
+        table.heading(column, text=column)
+        table.column(column, width=145)
+
+    table.pack(fill="x", padx=12, pady=10)
+
+    selected_label = tk.Label(
+        dashboard,
+        text="Select a report from the table.",
+        font=("Arial", 10)
+    )
+    selected_label.pack(pady=5)
+
+    update_frame = tk.LabelFrame(
+        dashboard,
+        text="Update Case",
+        padx=12,
+        pady=10
+    )
+    update_frame.pack(fill="x", padx=12, pady=10)
+
+    tk.Label(update_frame, text="New Status").grid(
+        row=0, column=0, sticky="w", pady=5
+    )
+
+    status_box = ttk.Combobox(
+        update_frame,
+        values=[
+            "Viewed by Officer",
+            "Action Started",
+            "Referred to Authorities",
+            "Closed"
+        ],
+        state="readonly",
+        width=28
+    )
+    status_box.grid(row=0, column=1, padx=8, pady=5)
+    status_box.set("Viewed by Officer")
+
+    tk.Label(update_frame, text="Officer Update").grid(
+        row=1, column=0, sticky="nw", pady=5
+    )
+
+    update_text = tk.Text(update_frame, width=55, height=4)
+    update_text.grid(row=1, column=1, padx=8, pady=5)
+
+    selected_report_id = [None]
+
+    def refresh_reports():
+        try:
+            table.delete(*table.get_children())
+
+            cursor.execute("""
+            SELECT id, category, subject, location, status, created_at
+            FROM reports
+            ORDER BY id DESC
+            """)
+
+            for report in cursor.fetchall():
+                table.insert("", tk.END, values=report)
+
+        except Error as error:
+            messagebox.showerror("Database Error", str(error))
+
+    def select_report(event=None):
+        selected = table.selection()
+
+        if not selected:
+            return
+
+        values = table.item(selected[0], "values")
+        selected_report_id[0] = int(values[0])
+
+        try:
+            cursor.execute("""
+            SELECT description, officer_update
+            FROM reports
+            WHERE id = %s
+            """, (selected_report_id[0],))
+
+            details = cursor.fetchone()
+
+            if details:
+                description, officer_update = details
+
+                selected_label.config(
+                    text=(
+                        f"Selected Report ID: {selected_report_id[0]}\n"
+                        f"Description: {description}"
+                    )
+                )
+
+                update_text.delete("1.0", tk.END)
+                update_text.insert(tk.END, officer_update or "")
+
+        except Error as error:
+            messagebox.showerror("Database Error", str(error))
+
+    table.bind("<<TreeviewSelect>>", select_report)
+
+    def save_case_update():
+        report_id = selected_report_id[0]
+
+        if report_id is None:
+            messagebox.showwarning(
+                "Select Report",
+                "Please select a report first."
+            )
+            return
+
+        new_status = status_box.get()
+        officer_update = update_text.get("1.0", tk.END).strip()
+
+        if not officer_update:
+            messagebox.showwarning(
+                "Missing Update",
+                "Please enter an officer update."
+            )
+            return
+
+        current_time = datetime.now()
+
+        try:
+            cursor.execute("""
+            UPDATE reports
+            SET status = %s,
+                officer_update = %s,
+                updated_at = %s
+            WHERE id = %s
+            """, (
+                new_status,
+                officer_update,
+                current_time,
+                report_id
+            ))
+
+            conn.commit()
+
+            messagebox.showinfo(
+                "Updated",
+                f"Report {report_id} has been updated."
+            )
+
+            refresh_reports()
+
+        except Error as error:
+            conn.rollback()
+            messagebox.showerror("Database Error", str(error))
+
+    tk.Button(
+        update_frame,
+        text="SAVE CASE UPDATE",
+        command=save_case_update,
+        bg="#176b45",
+        fg="white",
+        width=22
+    ).grid(row=2, column=1, sticky="w", pady=10)
+
+    tk.Button(
+        dashboard,
+        text="REFRESH REPORTS",
+        command=refresh_reports,
+        bg="#176b9b",
+        fg="white"
+    ).pack(pady=5)
+
+    # Check for newly submitted reports every 3 seconds.
+    cursor.execute("SELECT MAX(id) FROM reports")
+    last_seen_id = [cursor.fetchone()[0] or 0]
+
+    def check_new_reports():
+        if not dashboard.winfo_exists():
+            return
+
+        try:
+            cursor.execute("SELECT MAX(id) FROM reports")
+            latest_id = cursor.fetchone()[0] or 0
+
+            if latest_id > last_seen_id[0]:
+                last_seen_id[0] = latest_id
+                refresh_reports()
+                play_beep()
+
+                messagebox.showinfo(
+                    "New Report Alert",
+                    "A new citizen report has been submitted!"
+                )
+
+        except Error as error:
+            messagebox.showerror("Database Error", str(error))
+
+        if dashboard.winfo_exists():
+            dashboard.after(3000, check_new_reports)
+
+    refresh_reports()
+    dashboard.after(3000, check_new_reports)
+
+
+# ==================================================
+# 11. OFFICER LOGIN BUTTON
+# ==================================================
+
+tk.Button(
+    root,
+    text="OFFICER LOGIN",
+    command=open_officer_login,
+    bg="#17365d",
+    fg="white",
+    font=("Arial", 12, "bold"),
+    width=22
+).pack(pady=12)
+
+
+# ==================================================
+# 12. CLOSE DATABASE WHEN PROGRAM CLOSES
+# ==================================================
+
+def close_application():
+    try:
+        if conn.is_connected():
+            cursor.close()
+            conn.close()
+    except Error:
+        pass
+
+    root.destroy()
+
+
+root.protocol("WM_DELETE_WINDOW", close_application)
+
+
+# ==================================================
+# 13. START PROGRAM
+# ==================================================
+
+root.mainloop()
