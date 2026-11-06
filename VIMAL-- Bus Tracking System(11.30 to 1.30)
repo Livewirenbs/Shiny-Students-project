@@ -1,0 +1,778 @@
+Title -- Real-Time Bus Tracking System
+=======================================================================
+ PYTHON CODE
+
+Main
+----------------------------------------------------------------------------
+
+import tkinter as tk
+from dashboard import BusTrackingDashboard
+
+if __name__ == "__main__":
+
+    root = tk.Tk()
+
+    app = BusTrackingDashboard(root)
+
+    root.mainloop()
+
+Dashboard
+----------------------------------------------------------------------------
+
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+from bus_management import get_all_buses
+from gps_tracking import update_location, get_latest_locations
+
+
+class BusTrackingDashboard:
+
+    def __init__(self, root):
+
+        self.root = root
+        self.root.title("Real-Time Bus Tracking System")
+        self.root.geometry("1150x700")
+        self.root.configure(bg="#edf2f7")
+
+        self.simulation_active = False
+        self.simulation_job = None
+
+        # Sample Salem-area coordinates
+        self.sim_lat = 11.6643
+        self.sim_lon = 78.1460
+
+        title = tk.Label(
+            root,
+            text="REAL-TIME BUS TRACKING SYSTEM",
+            font=("Arial", 21, "bold"),
+            bg="#172554",
+            fg="white",
+            pady=18
+        )
+        title.pack(fill="x")
+
+        self.create_input_section()
+        self.create_table()
+
+        self.status = tk.Label(
+            root,
+            text="System ready",
+            font=("Arial", 11, "bold"),
+            bg="#edf2f7"
+        )
+        self.status.pack(pady=8)
+
+        self.refresh_dashboard()
+        self.root.protocol("WM_DELETE_WINDOW", self.close_app)
+
+    def create_input_section(self):
+
+        frame = tk.LabelFrame(
+            self.root,
+            text="GPS Location Management",
+            font=("Arial", 12, "bold"),
+            padx=12,
+            pady=12
+        )
+        frame.pack(fill="x", padx=20, pady=15)
+
+        tk.Label(frame, text="Select Bus").grid(
+            row=0, column=0, padx=5
+        )
+
+        self.bus_combo = ttk.Combobox(
+            frame,
+            state="readonly",
+            width=20
+        )
+        self.bus_combo.grid(row=0, column=1, padx=5)
+
+        tk.Label(frame, text="Latitude").grid(
+            row=0, column=2, padx=5
+        )
+
+        self.lat_entry = tk.Entry(frame, width=15)
+        self.lat_entry.grid(row=0, column=3, padx=5)
+        self.lat_entry.insert(0, "11.6643000")
+
+        tk.Label(frame, text="Longitude").grid(
+            row=0, column=4, padx=5
+        )
+
+        self.lon_entry = tk.Entry(frame, width=15)
+        self.lon_entry.grid(row=0, column=5, padx=5)
+        self.lon_entry.insert(0, "78.1460000")
+
+        tk.Label(frame, text="Speed (km/h)").grid(
+            row=1, column=0, padx=5, pady=12
+        )
+
+        self.speed_entry = tk.Entry(frame, width=15)
+        self.speed_entry.grid(row=1, column=1, padx=5)
+
+        self.speed_entry.insert(0, "35")
+
+        tk.Button(
+            frame,
+            text="UPDATE GPS",
+            command=self.manual_update,
+            bg="#2563eb",
+            fg="white",
+            padx=12
+        ).grid(row=1, column=2, padx=5)
+
+        tk.Button(
+            frame,
+            text="START SIMULATION",
+            command=self.start_simulation,
+            bg="#16a34a",
+            fg="white",
+            padx=12
+        ).grid(row=1, column=3, padx=5)
+
+        tk.Button(
+            frame,
+            text="STOP",
+            command=self.stop_simulation,
+            bg="#dc2626",
+            fg="white",
+            padx=12
+        ).grid(row=1, column=4, padx=5)
+
+        self.bus_mapping = {}
+        self.load_buses()
+
+    def load_buses(self):
+
+        try:
+            buses = get_all_buses()
+
+            self.bus_mapping = {
+                f"{bus[1]} - {bus[2]}": bus[0]
+                for bus in buses
+            }
+
+            self.bus_combo["values"] = list(
+                self.bus_mapping.keys()
+            )
+
+            if buses:
+                self.bus_combo.current(0)
+
+        except Exception as error:
+            messagebox.showerror(
+                "Database Error", str(error)
+            )
+
+    def create_table(self):
+
+        frame = tk.LabelFrame(
+            self.root,
+            text="Live Bus Location Records",
+            font=("Arial", 12, "bold"),
+            padx=10,
+            pady=10
+        )
+        frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+        columns = (
+            "Bus Number",
+            "Bus Name",
+            "Latitude",
+            "Longitude",
+            "Speed",
+            "Last Updated"
+        )
+
+        self.tree = ttk.Treeview(
+            frame,
+            columns=columns,
+            show="headings",
+            height=16
+        )
+
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(
+                col,
+                width=170,
+                anchor="center"
+            )
+
+        self.tree.pack(fill="both", expand=True)
+
+    def manual_update(self):
+
+        try:
+            selected = self.bus_combo.get()
+
+            if not selected:
+                raise ValueError("Select a bus")
+
+            bus_id = self.bus_mapping[selected]
+
+            lat = float(self.lat_entry.get())
+            lon = float(self.lon_entry.get())
+            speed = float(self.speed_entry.get())
+
+            update_location(
+                bus_id, lat, lon, speed
+            )
+
+            self.status.config(
+                text=f"Location updated: {selected}"
+            )
+
+            self.refresh_table()
+
+        except ValueError as error:
+            messagebox.showerror(
+                "Input Error", str(error)
+            )
+
+        except Exception as error:
+            messagebox.showerror(
+                "Database Error", str(error)
+            )
+
+    def start_simulation(self):
+
+        if not self.bus_combo.get():
+            messagebox.showwarning(
+                "Warning", "Register a bus first"
+            )
+            return
+
+        if self.simulation_active:
+            return
+
+        self.simulation_active = True
+        self.simulate_bus()
+
+    def simulate_bus(self):
+
+        if not self.simulation_active:
+            return
+
+        try:
+            selected = self.bus_combo.get()
+            bus_id = self.bus_mapping[selected]
+
+            # Simulated movement
+            self.sim_lat += 0.0002
+            self.sim_lon += 0.0002
+
+            update_location(
+                bus_id,
+                self.sim_lat,
+                self.sim_lon,
+                35.0
+            )
+
+            self.status.config(
+                text="SIMULATION ACTIVE - Updating GPS"
+            )
+
+            self.refresh_table()
+
+        except Exception as error:
+            self.stop_simulation()
+
+            messagebox.showerror(
+                "Simulation Error", str(error)
+            )
+            return
+
+        self.simulation_job = self.root.after(
+            3000, self.simulate_bus
+        )
+
+    def stop_simulation(self):
+
+        self.simulation_active = False
+
+        if self.simulation_job is not None:
+            self.root.after_cancel(self.simulation_job)
+            self.simulation_job = None
+
+        self.status.config(
+            text="GPS simulation stopped"
+        )
+
+    def refresh_table(self):
+
+        records = get_latest_locations()
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        for record in records:
+            self.tree.insert(
+                "", "end",
+                values=record
+            )
+
+    def refresh_dashboard(self):
+
+        try:
+            self.refresh_table()
+
+        except Exception as error:
+            self.status.config(
+                text=f"Database error: {error}"
+            )
+
+        self.root.after(
+            5000, self.refresh_dashboard
+        )
+
+    def close_app(self):
+
+        self.stop_simulation()
+        self.root.destroy()
+
+GSP Tracking
+-----------------------------------------------------------------------------------
+
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+from bus_management import get_all_buses
+from gps_tracking import update_location, get_latest_locations
+
+
+class BusTrackingDashboard:
+
+    def __init__(self, root):
+
+        self.root = root
+        self.root.title("Real-Time Bus Tracking System")
+        self.root.geometry("1150x700")
+        self.root.configure(bg="#edf2f7")
+
+        self.simulation_active = False
+        self.simulation_job = None
+
+        # Sample Salem-area coordinates
+        self.sim_lat = 11.6643
+        self.sim_lon = 78.1460
+
+        title = tk.Label(
+            root,
+            text="REAL-TIME BUS TRACKING SYSTEM",
+            font=("Arial", 21, "bold"),
+            bg="#172554",
+            fg="white",
+            pady=18
+        )
+        title.pack(fill="x")
+
+        self.create_input_section()
+        self.create_table()
+
+        self.status = tk.Label(
+            root,
+            text="System ready",
+            font=("Arial", 11, "bold"),
+            bg="#edf2f7"
+        )
+        self.status.pack(pady=8)
+
+        self.refresh_dashboard()
+        self.root.protocol("WM_DELETE_WINDOW", self.close_app)
+
+    def create_input_section(self):
+
+        frame = tk.LabelFrame(
+            self.root,
+            text="GPS Location Management",
+            font=("Arial", 12, "bold"),
+            padx=12,
+            pady=12
+        )
+        frame.pack(fill="x", padx=20, pady=15)
+
+        tk.Label(frame, text="Select Bus").grid(
+            row=0, column=0, padx=5
+        )
+
+        self.bus_combo = ttk.Combobox(
+            frame,
+            state="readonly",
+            width=20
+        )
+        self.bus_combo.grid(row=0, column=1, padx=5)
+
+        tk.Label(frame, text="Latitude").grid(
+            row=0, column=2, padx=5
+        )
+
+        self.lat_entry = tk.Entry(frame, width=15)
+        self.lat_entry.grid(row=0, column=3, padx=5)
+        self.lat_entry.insert(0, "11.6643000")
+
+        tk.Label(frame, text="Longitude").grid(
+            row=0, column=4, padx=5
+        )
+
+        self.lon_entry = tk.Entry(frame, width=15)
+        self.lon_entry.grid(row=0, column=5, padx=5)
+        self.lon_entry.insert(0, "78.1460000")
+
+        tk.Label(frame, text="Speed (km/h)").grid(
+            row=1, column=0, padx=5, pady=12
+        )
+
+        self.speed_entry = tk.Entry(frame, width=15)
+        self.speed_entry.grid(row=1, column=1, padx=5)
+
+        self.speed_entry.insert(0, "35")
+
+        tk.Button(
+            frame,
+            text="UPDATE GPS",
+            command=self.manual_update,
+            bg="#2563eb",
+            fg="white",
+            padx=12
+        ).grid(row=1, column=2, padx=5)
+
+        tk.Button(
+            frame,
+            text="START SIMULATION",
+            command=self.start_simulation,
+            bg="#16a34a",
+            fg="white",
+            padx=12
+        ).grid(row=1, column=3, padx=5)
+
+        tk.Button(
+            frame,
+            text="STOP",
+            command=self.stop_simulation,
+            bg="#dc2626",
+            fg="white",
+            padx=12
+        ).grid(row=1, column=4, padx=5)
+
+        self.bus_mapping = {}
+        self.load_buses()
+
+    def load_buses(self):
+
+        try:
+            buses = get_all_buses()
+
+            self.bus_mapping = {
+                f"{bus[1]} - {bus[2]}": bus[0]
+                for bus in buses
+            }
+
+            self.bus_combo["values"] = list(
+                self.bus_mapping.keys()
+            )
+
+            if buses:
+                self.bus_combo.current(0)
+
+        except Exception as error:
+            messagebox.showerror(
+                "Database Error", str(error)
+            )
+
+    def create_table(self):
+
+        frame = tk.LabelFrame(
+            self.root,
+            text="Live Bus Location Records",
+            font=("Arial", 12, "bold"),
+            padx=10,
+            pady=10
+        )
+        frame.pack(fill="both", expand=True, padx=20, pady=10)
+
+        columns = (
+            "Bus Number",
+            "Bus Name",
+            "Latitude",
+            "Longitude",
+            "Speed",
+            "Last Updated"
+        )
+
+        self.tree = ttk.Treeview(
+            frame,
+            columns=columns,
+            show="headings",
+            height=16
+        )
+
+        for col in columns:
+            self.tree.heading(col, text=col)
+            self.tree.column(
+                col,
+                width=170,
+                anchor="center"
+            )
+
+        self.tree.pack(fill="both", expand=True)
+
+    def manual_update(self):
+
+        try:
+            selected = self.bus_combo.get()
+
+            if not selected:
+                raise ValueError("Select a bus")
+
+            bus_id = self.bus_mapping[selected]
+
+            lat = float(self.lat_entry.get())
+            lon = float(self.lon_entry.get())
+            speed = float(self.speed_entry.get())
+
+            update_location(
+                bus_id, lat, lon, speed
+            )
+
+            self.status.config(
+                text=f"Location updated: {selected}"
+            )
+
+            self.refresh_table()
+
+        except ValueError as error:
+            messagebox.showerror(
+                "Input Error", str(error)
+            )
+
+        except Exception as error:
+            messagebox.showerror(
+                "Database Error", str(error)
+            )
+
+    def start_simulation(self):
+
+        if not self.bus_combo.get():
+            messagebox.showwarning(
+                "Warning", "Register a bus first"
+            )
+            return
+
+        if self.simulation_active:
+            return
+
+        self.simulation_active = True
+        self.simulate_bus()
+
+    def simulate_bus(self):
+
+        if not self.simulation_active:
+            return
+
+        try:
+            selected = self.bus_combo.get()
+            bus_id = self.bus_mapping[selected]
+
+            # Simulated movement
+            self.sim_lat += 0.0002
+            self.sim_lon += 0.0002
+
+            update_location(
+                bus_id,
+                self.sim_lat,
+                self.sim_lon,
+                35.0
+            )
+
+            self.status.config(
+                text="SIMULATION ACTIVE - Updating GPS"
+            )
+
+            self.refresh_table()
+
+        except Exception as error:
+            self.stop_simulation()
+
+            messagebox.showerror(
+                "Simulation Error", str(error)
+            )
+            return
+
+        self.simulation_job = self.root.after(
+            3000, self.simulate_bus
+        )
+
+    def stop_simulation(self):
+
+        self.simulation_active = False
+
+        if self.simulation_job is not None:
+            self.root.after_cancel(self.simulation_job)
+            self.simulation_job = None
+
+        self.status.config(
+            text="GPS simulation stopped"
+        )
+
+    def refresh_table(self):
+
+        records = get_latest_locations()
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        for record in records:
+            self.tree.insert(
+                "", "end",
+                values=record
+            )
+
+    def refresh_dashboard(self):
+
+        try:
+            self.refresh_table()
+
+        except Exception as error:
+            self.status.config(
+                text=f"Database error: {error}"
+            )
+
+        self.root.after(
+            5000, self.refresh_dashboard
+        )
+
+    def close_app(self):
+
+        self.stop_simulation()
+        self.root.destroy()
+
+
+Bus Management
+---------------------------------------------------------------------------
+
+
+from database import get_connection
+
+def get_all_buses():
+
+    con = get_connection()
+    cur = con.cursor()
+
+    cur.execute("""
+        SELECT bus_id, bus_number, bus_name
+        FROM buses
+        ORDER BY bus_id
+    """)
+
+    records = cur.fetchall()
+
+    cur.close()
+    con.close()
+
+    return records
+
+
+def add_bus(number, name, capacity):
+
+    con = get_connection()
+    cur = con.cursor()
+
+    cur.execute("""
+        INSERT INTO buses
+        (bus_number, bus_name, capacity)
+        VALUES (%s, %s, %s)
+    """, (number, name, capacity))
+
+    con.commit()
+
+    cur.close()
+    con.close()
+
+Database
+------------------------------------------------------------------------------------------
+
+
+import psycopg2
+
+def get_connection():
+    return psycopg2.connect(
+        host="localhost",
+        database="bus_tracking",
+        user="postgres",
+        password="020797",
+        port="5432"
+    )
+
+
+PostgreSQL Code
+--------------------------------------------------------------------------------------------
+
+CREATE TABLE buses (
+    bus_id SERIAL PRIMARY KEY,
+    bus_number VARCHAR(20) UNIQUE NOT NULL,
+    bus_name VARCHAR(100),
+    capacity INTEGER
+);
+
+CREATE TABLE drivers (
+    driver_id SERIAL PRIMARY KEY,
+    driver_name VARCHAR(100),
+    phone VARCHAR(15),
+    bus_id INTEGER REFERENCES buses(bus_id)
+);
+
+CREATE TABLE routes (
+    route_id SERIAL PRIMARY KEY,
+    source VARCHAR(100),
+    destination VARCHAR(100),
+    route_name VARCHAR(100)
+);
+
+CREATE TABLE bus_locations (
+    location_id BIGSERIAL PRIMARY KEY,
+    bus_id INTEGER NOT NULL REFERENCES buses(bus_id),
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL,
+    speed DOUBLE PRECISION DEFAULT 0,
+    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE bus_routes (
+    bus_id INTEGER REFERENCES buses(bus_id),
+    route_id INTEGER REFERENCES routes(route_id),
+    PRIMARY KEY (bus_id, route_id)
+);
+
+INSERT INTO buses
+(bus_number, bus_name, capacity)
+VALUES
+('TN30AB1234', 'Salem Express', 50),
+('TN30CD5678', 'City Bus 01', 45),
+('TN30EF9012', 'Town Bus 02', 40);
+
+INSERT INTO drivers
+(driver_name, phone, bus_id)
+VALUES
+('Arun', '9876543210', 1),
+('Kumar', '9876543211', 2),
+('Vijay', '9876543212', 3);
+
+INSERT INTO routes
+(source, destination, route_name)
+VALUES
+('Salem', 'Attur', 'Salem - Attur'),
+('Salem', 'Omalur', 'Salem - Omalur'),
+('Salem', 'Yercaud', 'Salem - Yercaud');
+
+INSERT INTO bus_routes
+(bus_id, route_id)
+VALUES
+(1, 1),
+(2, 2),
+(3, 3);
+
+select * from bus_routes
