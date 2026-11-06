@@ -1,0 +1,1127 @@
+Title : Face track Face Recognition Attendance
+Gopika.G
+python code
+_____________________________________________________
+Management System
+import os
+import csv
+import mysql.connector
+from mysql.connector import IntegrityError
+import shutil
+import hashlib
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+from datetime import datetime, date
+
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+
+
+# ================= CONFIGURATION =================
+
+APP_NAME = "FaceTrack - Attendance Management System"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# MySQL connection settings: replace the password with your MySQL root password.
+DB_CONFIG = {
+    "host": "localhost",
+    "port": 3306,
+    "user": "root",
+    "password": "12345",
+    "database": "facetrack",
+    "autocommit": False
+}
+FACE_DIR = os.path.join(BASE_DIR, "student_faces")
+BACKUP_DIR = os.path.join(BASE_DIR, "database_backups")
+
+os.makedirs(FACE_DIR, exist_ok=True)
+os.makedirs(BACKUP_DIR, exist_ok=True)
+
+BG = "#eef2f7"
+DARK = "#172554"
+BLUE = "#2563eb"
+GREEN = "#16a34a"
+RED = "#dc2626"
+ORANGE = "#ea580c"
+WHITE = "#ffffff"
+TEXT = "#1e293b"
+
+CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
+
+if face_cascade.empty():
+    raise RuntimeError("OpenCV face detector could not be loaded.")
+
+# ================= DATABASE =================
+
+class DatabaseConnection:
+    """Small adapter that keeps the existing app's execute/fetch style."""
+    def __init__(self):
+        self.connection = mysql.connector.connect(**DB_CONFIG)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            if exc_type is None:
+                self.connection.commit()
+            else:
+                self.connection.rollback()
+        finally:
+            self.connection.close()
+
+    def execute(self, query, params=None):
+        cursor = self.connection.cursor()
+        cursor.execute(query.replace("?", "%s"), params or ())
+        return cursor
+
+
+def connect_db():
+    return DatabaseConnection()
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def initialize_database():
+    """Create required MySQL tables and the default admin if not present."""
+    with connect_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS students (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                department VARCHAR(100),
+                year VARCHAR(30),
+                face_id VARCHAR(100) UNIQUE,
+                photo_path TEXT,
+                created_at DATETIME
+            ) ENGINE=InnoDB
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS attendance (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                student_id INT NOT NULL,
+                attendance_date DATE NOT NULL,
+                attendance_time TIME NOT NULL,
+                status VARCHAR(20) DEFAULT 'Present',
+                CONSTRAINT fk_attendance_student
+                    FOREIGN KEY (student_id) REFERENCES students(id)
+                    ON DELETE CASCADE,
+                UNIQUE KEY uq_student_attendance_date (student_id, attendance_date)
+            ) ENGINE=InnoDB
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                username VARCHAR(50) UNIQUE,
+                password VARCHAR(255)
+            ) ENGINE=InnoDB
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                action VARCHAR(100),
+                details TEXT,
+                log_time DATETIME
+            ) ENGINE=InnoDB
+        """)
+
+        count = conn.execute("SELECT COUNT(*) FROM admins").fetchone()[0]
+        if count == 0:
+            conn.execute(
+                "INSERT INTO admins(username,password) VALUES (?,?)",
+                ("admin", hash_password("admin123"))
+            )
+
+def audit(action, details):
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT INTO audit_log(action,details,log_time) VALUES (?,?,?)",
+            (action, details, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+
+def get_student_count():
+    with connect_db() as conn:
+        return conn.execute("SELECT COUNT(*) FROM students").fetchone()[0]
+
+def get_present_count():
+    with connect_db() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM attendance WHERE attendance_date=?",
+            (date.today().isoformat(),)
+        ).fetchone()[0]
+
+def get_absent_count():
+    return max(0, get_student_count() - get_present_count())
+
+def get_attendance_percentage():
+    total = get_student_count()
+    return round(get_present_count() / total * 100, 2) if total else 0
+
+# ================= MAIN WINDOW =================
+
+root = tk.Tk()
+root.title(APP_NAME)
+root.geometry("1200x750")
+root.minsize(950, 650)
+root.configure(bg=BG)
+
+current_user = None
+
+def clear_window():
+    for widget in root.winfo_children():
+        widget.destroy()
+
+def make_button(parent, text, command, color=BLUE):
+    return tk.Button(
+        parent, text=text, command=command,
+        bg=color, fg=WHITE, activebackground=color,
+        activeforeground=WHITE, font=("Segoe UI", 10, "bold"),
+        relief="flat", cursor="hand2", padx=12, pady=8
+    )
+
+def make_label(parent, text, size=11, bold=False, color=TEXT):
+    return tk.Label(
+        parent, text=text, bg=parent.cget("bg"), fg=color,
+        font=("Segoe UI", size, "bold" if bold else "normal")
+    )
+
+def get_selected_student(tree):
+    selected = tree.selection()
+    if not selected:
+        messagebox.showwarning("Select Student", "Please select a student.")
+        return None
+    return tree.item(selected[0])["values"]
+
+def create_tree(parent, columns, headings, height=15):
+    tree = ttk.Treeview(
+        parent, columns=columns, show="headings", height=height
+    )
+    for col, heading in zip(columns, headings):
+        tree.heading(col, text=heading)
+        tree.column(col, width=160)
+    return tree
+
+# ================= ADMIN LOGIN =================
+
+def show_login():
+    clear_window()
+    frame = tk.Frame(root, bg=WHITE, padx=40, pady=35)
+    frame.place(relx=0.5, rely=0.5, anchor="center")
+
+    tk.Label(
+        frame, text="FACETRACK", bg=WHITE, fg=DARK,
+        font=("Segoe UI", 25, "bold")
+    ).pack(pady=10)
+
+    make_label(frame, "Admin Login", 14).pack(pady=5)
+
+    make_label(frame, "Username").pack(anchor="w")
+    username = tk.Entry(frame, font=("Segoe UI", 12), width=28)
+    username.pack(pady=5)
+
+    make_label(frame, "Password").pack(anchor="w")
+    password = tk.Entry(frame, font=("Segoe UI", 12), width=28, show="*")
+    password.pack(pady=5)
+
+    def login():
+        global current_user
+        with connect_db() as conn:
+            result = conn.execute(
+                "SELECT username FROM admins WHERE username=? AND password=?",
+                (username.get().strip(), hash_password(password.get()))
+            ).fetchone()
+
+        if result:
+            current_user = result[0]
+            audit("LOGIN", f"Admin {current_user} logged in")
+            show_dashboard()
+        else:
+            messagebox.showerror("Login Failed", "Incorrect username or password.")
+
+    make_button(frame, "LOGIN", login, GREEN).pack(fill="x", pady=15)
+    tk.Label(
+        frame, text="Default login: admin / admin123",
+        bg=WHITE, fg="#64748b", font=("Segoe UI", 9)
+    ).pack()
+
+# ================= DASHBOARD =================
+
+def show_dashboard():
+    clear_window()
+
+    header = tk.Frame(root, bg=DARK, height=75)
+    header.pack(fill="x")
+
+    tk.Label(
+        header, text="FACETRACK", bg=DARK, fg=WHITE,
+        font=("Segoe UI", 23, "bold")
+    ).pack(side="left", padx=25, pady=15)
+
+    clock = tk.Label(header, bg=DARK, fg=WHITE, font=("Segoe UI", 11))
+    clock.pack(side="right", padx=25)
+
+    def update_clock():
+        if clock.winfo_exists():
+            clock.config(text=datetime.now().strftime("%d-%m-%Y  %I:%M:%S %p"))
+            root.after(1000, update_clock)
+
+    update_clock()
+
+    content = tk.Frame(root, bg=BG)
+    content.pack(fill="both", expand=True, padx=25, pady=20)
+
+    make_label(content, "Attendance Dashboard", 20, True, DARK).pack(
+        anchor="w", pady=(0, 15)
+    )
+
+    cards = tk.Frame(content, bg=BG)
+    cards.pack(fill="x")
+
+    card_data = [
+        ("Registered Students", get_student_count(), BLUE),
+        ("Present Today", get_present_count(), GREEN),
+        ("Absent Today", get_absent_count(), RED),
+        ("Attendance Today", f"{get_attendance_percentage()}%", ORANGE)
+    ]
+
+    for title, value, color in card_data:
+        card = tk.Frame(cards, bg=WHITE, padx=20, pady=18)
+        card.pack(side="left", fill="both", expand=True, padx=7)
+        make_label(card, title, 10, color="#64748b").pack()
+        make_label(card, str(value), 24, True, color).pack(pady=5)
+
+    middle = tk.Frame(content, bg=BG)
+    middle.pack(fill="both", expand=True, pady=20)
+
+    graph_frame = tk.Frame(middle, bg=WHITE)
+    graph_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
+
+    make_label(graph_frame, "Today's Attendance", 13, True, DARK).pack(pady=10)
+
+    fig = Figure(figsize=(5, 3), dpi=90)
+    ax = fig.add_subplot(111)
+    total = get_student_count()
+    present = get_present_count()
+    absent = max(0, total - present)
+
+    if total:
+        ax.pie(
+            [present, absent], labels=["Present", "Absent"],
+            autopct="%1.1f%%", startangle=90
+        )
+    else:
+        ax.text(0.5, 0.5, "No students registered", ha="center", va="center")
+
+    ax.set_title("Attendance Summary")
+    chart = FigureCanvasTkAgg(fig, master=graph_frame)
+    chart.draw()
+    chart.get_tk_widget().pack(fill="both", expand=True)
+
+    recent_frame = tk.Frame(middle, bg=WHITE)
+    recent_frame.pack(side="left", fill="both", expand=True, padx=(10, 0))
+
+    make_label(recent_frame, "Recent Attendance", 13, True, DARK).pack(pady=10)
+
+    recent = create_tree(
+        recent_frame, ("name", "date", "time"),
+        ("Student", "Date", "Time"), 8
+    )
+    recent.pack(fill="both", expand=True, padx=10, pady=10)
+
+    with connect_db() as conn:
+        rows = conn.execute("""
+            SELECT students.name, attendance.attendance_date,
+                   attendance.attendance_time
+            FROM attendance
+            JOIN students ON students.id=attendance.student_id
+            ORDER BY attendance.id DESC LIMIT 10
+        """).fetchall()
+
+    for row in rows:
+        recent.insert("", "end", values=row)
+
+    buttons = tk.Frame(content, bg=BG)
+    buttons.pack(fill="x")
+
+    actions = [
+        ("Register Student", show_register_student, BLUE),
+        ("Student Management", show_student_management, BLUE),
+        ("Start Face Recognition", start_face_recognition, GREEN),
+        ("Attendance Reports", show_attendance_reports, ORANGE),
+        ("Export CSV / PDF", export_report, DARK),
+        ("Backup Database", backup_database, DARK),
+        ("Change Password", change_password, ORANGE),
+        ("Logout", show_login, RED)
+    ]
+
+    for text, command, color in actions:
+        make_button(buttons, text, command, color).pack(
+            side="left", padx=3, pady=5
+        )
+
+# ================= STUDENT REGISTRATION =================
+
+def show_register_student():
+    clear_window()
+
+    make_label(root, "Register Student", 22, True, DARK).pack(pady=20)
+    form = tk.Frame(root, bg=WHITE, padx=30, pady=25)
+    form.pack()
+
+    make_label(form, "Student Name").grid(row=0, column=0, sticky="w", pady=8)
+    name_entry = tk.Entry(form, width=35, font=("Segoe UI", 11))
+    name_entry.grid(row=0, column=1, pady=8)
+
+    make_label(form, "Department").grid(row=1, column=0, sticky="w", pady=8)
+    department_entry = tk.Entry(form, width=35, font=("Segoe UI", 11))
+    department_entry.grid(row=1, column=1, pady=8)
+
+    make_label(form, "Year").grid(row=2, column=0, sticky="w", pady=8)
+    year_combo = ttk.Combobox(
+        form, values=["1st Year", "2nd Year", "3rd Year", "4th Year"],
+        width=32, state="readonly"
+    )
+    year_combo.grid(row=2, column=1, pady=8)
+    year_combo.current(0)
+
+    photo_path = tk.StringVar()
+    photo_label = make_label(form, "No photo selected")
+    photo_label.grid(row=3, column=1, sticky="w")
+
+    def choose_photo():
+        path = filedialog.askopenfilename(
+            filetypes=[("Image Files", "*.jpg *.jpeg *.png")]
+        )
+        if path:
+            photo_path.set(path)
+            photo_label.config(text=os.path.basename(path))
+
+    make_label(form, "Face Photo").grid(row=3, column=0, sticky="w", pady=8)
+    make_button(form, "Choose Photo", choose_photo).grid(
+        row=4, column=1, sticky="w", pady=5
+    )
+
+    def save_student():
+        name = name_entry.get().strip()
+        department = department_entry.get().strip()
+        year = year_combo.get()
+        source = photo_path.get()
+
+        if not name or not source:
+            messagebox.showwarning(
+                "Required", "Enter student name and choose a photo."
+            )
+            return
+
+        image = cv2.imread(source)
+        if image is None:
+            messagebox.showerror("Photo Error", "Unable to read photo.")
+            return
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
+        )
+
+        if len(faces) == 0:
+            messagebox.showerror("Face Not Found", "Choose a clear face photo.")
+            return
+
+        if len(faces) > 1:
+            messagebox.showerror("Multiple Faces", "Choose a photo with one face.")
+            return
+
+        face_id = "FT" + datetime.now().strftime("%y%m%d%H%M%S%f")
+        safe_name = "".join(
+            ch for ch in name if ch.isalnum() or ch in ("_", "-")
+        )
+        destination = os.path.join(FACE_DIR, f"{face_id}_{safe_name}.jpg")
+
+        try:
+            shutil.copy2(source, destination)
+            with connect_db() as conn:
+                conn.execute("""
+                    INSERT INTO students
+                    (name,department,year,face_id,photo_path,created_at)
+                    VALUES (?,?,?,?,?,?)
+                """, (
+                    name, department, year, face_id, destination,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ))
+
+            audit("STUDENT_REGISTERED", name)
+            messagebox.showinfo("Success", f"Student registered!\nFace ID: {face_id}")
+            show_dashboard()
+
+        except IntegrityError:
+            if os.path.exists(destination):
+                os.remove(destination)
+            messagebox.showerror("Database Error", "Unable to register student.")
+
+    make_button(form, "SAVE STUDENT", save_student, GREEN).grid(
+        row=5, column=1, sticky="w", pady=15
+    )
+    make_button(root, "Back to Dashboard", show_dashboard, DARK).pack(pady=10)
+
+# ================= STUDENT MANAGEMENT =================
+
+def show_student_management():
+    clear_window()
+    make_label(root, "Student Management", 22, True, DARK).pack(pady=15)
+
+    search_frame = tk.Frame(root, bg=BG)
+    search_frame.pack(fill="x", padx=20)
+
+    search_entry = tk.Entry(search_frame, width=35, font=("Segoe UI", 11))
+    search_entry.pack(side="left", padx=5)
+
+    tree = create_tree(
+        root, ("id", "name", "department", "year", "face_id"),
+        ("ID", "Name", "Department", "Year", "Face ID"), 18
+    )
+    tree.pack(fill="both", expand=True, padx=20, pady=15)
+
+    def load_students(search=""):
+        tree.delete(*tree.get_children())
+        with connect_db() as conn:
+            rows = conn.execute("""
+                SELECT id,name,department,year,face_id FROM students
+                WHERE name LIKE ? OR face_id LIKE ?
+                ORDER BY id DESC
+            """, (f"%{search}%", f"%{search}%")).fetchall()
+
+        for row in rows:
+            tree.insert("", "end", values=row)
+
+    def edit_student():
+        selected = get_selected_student(tree)
+        if not selected:
+            return
+
+        student_id = selected[0]
+        with connect_db() as conn:
+            row = conn.execute(
+                "SELECT name,department,year FROM students WHERE id=?",
+                (student_id,)
+            ).fetchone()
+
+        if not row:
+            return
+
+        win = tk.Toplevel(root)
+        win.title("Edit Student")
+        win.geometry("400x300")
+        win.configure(bg=WHITE)
+
+        entries = []
+        for label, value in zip(("Name", "Department", "Year"), row):
+            make_label(win, label).pack(pady=5)
+            entry = tk.Entry(win, width=30)
+            entry.insert(0, value or "")
+            entry.pack()
+            entries.append(entry)
+
+        def save_edit():
+            name, department, year = [e.get().strip() for e in entries]
+            if not name:
+                messagebox.showwarning("Required", "Name cannot be empty.")
+                return
+
+            with connect_db() as conn:
+                conn.execute("""
+                    UPDATE students SET name=?,department=?,year=? WHERE id=?
+                """, (name, department, year, student_id))
+
+            audit("STUDENT_UPDATED", name)
+            win.destroy()
+            load_students()
+            messagebox.showinfo("Updated", "Student details updated.")
+
+        make_button(win, "SAVE CHANGES", save_edit, GREEN).pack(pady=15)
+
+    def delete_student():
+        selected = get_selected_student(tree)
+        if not selected:
+            return
+
+        student_id, name = selected[0], selected[1]
+        if not messagebox.askyesno(
+            "Delete Student", f"Delete {name} and attendance records?"
+        ):
+            return
+
+        with connect_db() as conn:
+            photo = conn.execute(
+                "SELECT photo_path FROM students WHERE id=?", (student_id,)
+            ).fetchone()
+
+            conn.execute("DELETE FROM attendance WHERE student_id=?", (student_id,))
+            conn.execute("DELETE FROM students WHERE id=?", (student_id,))
+
+        if photo and photo[0] and os.path.exists(photo[0]):
+            os.remove(photo[0])
+
+        audit("STUDENT_DELETED", name)
+        load_students()
+        messagebox.showinfo("Deleted", "Student deleted successfully.")
+
+    def show_profile():
+        selected = get_selected_student(tree)
+        if not selected:
+            return
+
+        with connect_db() as conn:
+            student = conn.execute("""
+                SELECT name,department,year,face_id,photo_path
+                FROM students WHERE id=?
+            """, (selected[0],)).fetchone()
+            total_days = conn.execute(
+                "SELECT COUNT(*) FROM attendance WHERE student_id=?",
+                (selected[0],)
+            ).fetchone()[0]
+
+        if not student:
+            return
+
+        profile = tk.Toplevel(root)
+        profile.title("Student Profile")
+        profile.geometry("450x450")
+        profile.configure(bg=WHITE)
+
+        make_label(profile, "Student Profile", 18, True, DARK).pack(pady=10)
+
+        if student[4] and os.path.exists(student[4]):
+            try:
+                image = Image.open(student[4])
+                image.thumbnail((150, 150))
+                photo = ImageTk.PhotoImage(image)
+                img_label = tk.Label(profile, image=photo, bg=WHITE)
+                img_label.image = photo
+                img_label.pack(pady=5)
+            except Exception:
+                pass
+
+        details = (
+            f"Name: {student[0]}\nDepartment: {student[1]}\n"
+            f"Year: {student[2]}\nFace ID: {student[3]}\n"
+            f"Attendance Days: {total_days}"
+        )
+        tk.Label(
+            profile, text=details, bg=WHITE, fg=TEXT,
+            font=("Segoe UI", 11), justify="left"
+        ).pack(pady=10)
+
+    make_button(search_frame, "Search", lambda: load_students(
+        search_entry.get().strip()
+    )).pack(side="left", padx=5)
+
+    make_button(search_frame, "Show All", load_students).pack(side="left", padx=5)
+
+    buttons = tk.Frame(root, bg=BG)
+    buttons.pack(pady=10)
+
+    for text, command, color in [
+        ("View Profile", show_profile, GREEN),
+        ("Edit Student", edit_student, ORANGE),
+        ("Delete Student", delete_student, RED),
+        ("Back", show_dashboard, DARK)
+    ]:
+        make_button(buttons, text, command, color).pack(side="left", padx=5)
+
+    load_students()
+
+# ================= FACE RECOGNITION =================
+
+def train_face_recognizer():
+    if not hasattr(cv2, "face"):
+        messagebox.showerror(
+            "OpenCV Error",
+            "LBPH recognizer is unavailable. Install opencv-contrib-python."
+        )
+        return None, {}
+
+    recognizer = cv2.face.LBPHFaceRecognizer_create()
+    faces, labels, label_to_student = [], [], {}
+
+    with connect_db() as conn:
+        students = conn.execute(
+            "SELECT id,name,photo_path FROM students"
+        ).fetchall()
+
+    for student_id, name, photo_path in students:
+        if not photo_path or not os.path.exists(photo_path):
+            continue
+
+        image = cv2.imread(photo_path)
+        if image is None:
+            continue
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        detected = face_cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
+        )
+
+        if len(detected) == 0:
+            continue
+
+        x, y, w, h = detected[0]
+        face = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
+        faces.append(face)
+        labels.append(student_id)
+        label_to_student[student_id] = name
+
+    if not faces:
+        return None, {}
+
+    recognizer.train(faces, np.array(labels))
+    return recognizer, label_to_student
+
+def mark_attendance(student_id):
+    today = date.today().isoformat()
+    current_time = datetime.now().strftime("%H:%M:%S")
+
+    try:
+        with connect_db() as conn:
+            conn.execute("""
+                INSERT INTO attendance
+                (student_id,attendance_date,attendance_time,status)
+                VALUES (?,?,?,'Present')
+            """, (student_id, today, current_time))
+
+        audit("ATTENDANCE_MARKED", f"Student ID {student_id}")
+        return True
+
+    except IntegrityError:
+        return False
+
+def start_face_recognition():
+    recognizer, label_to_student = train_face_recognizer()
+
+    if recognizer is None:
+        messagebox.showwarning(
+            "No Training Data", "Register students with clear face photos first."
+        )
+        return
+
+    camera = cv2.VideoCapture(0)
+    if not camera.isOpened():
+        messagebox.showerror(
+            "Camera Error", "Unable to open webcam. Check camera permission."
+        )
+        return
+
+    recognized_ids = set()
+    unknown_alerted = False
+    MATCH_THRESHOLD = 75
+
+    try:
+        while True:
+            success, frame = camera.read()
+            if not success:
+                break
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            detected = face_cascade.detectMultiScale(
+                gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
+            )
+
+            for x, y, w, h in detected:
+                face = cv2.resize(gray[y:y+h, x:x+w], (200, 200))
+                label, confidence = recognizer.predict(face)
+
+                if confidence < MATCH_THRESHOLD and label in label_to_student:
+                    name = label_to_student[label]
+                    color = (0, 180, 0)
+                    display_text = f"{name} ({max(0, 100-confidence):.0f}%)"
+
+                    if label not in recognized_ids:
+                        recognized_ids.add(label)
+                        if mark_attendance(label):
+                            print(f"Attendance marked: {name}")
+                        else:
+                            print(f"Already marked today: {name}")
+                else:
+                    color = (0, 0, 255)
+                    display_text = "Unknown Face"
+                    if not unknown_alerted:
+                        print("Unknown face detected!")
+                        unknown_alerted = True
+
+                cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+                cv2.putText(
+                    frame, display_text, (x, y-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2
+                )
+
+            cv2.putText(
+                frame, "Press Q to close", (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
+            )
+            cv2.imshow("FaceTrack - Face Recognition", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
+        show_dashboard()
+
+# ================= ATTENDANCE REPORTS =================
+
+def show_attendance_reports():
+    clear_window()
+    make_label(root, "Attendance Reports", 22, True, DARK).pack(pady=15)
+
+    filter_frame = tk.Frame(root, bg=BG)
+    filter_frame.pack(pady=10)
+
+    make_label(filter_frame, "Date (YYYY-MM-DD):").pack(side="left", padx=5)
+    date_entry = tk.Entry(filter_frame, width=15)
+    date_entry.insert(0, date.today().isoformat())
+    date_entry.pack(side="left", padx=5)
+
+    tree = create_tree(
+        root, ("name", "department", "date", "time", "status"),
+        ("Student Name", "Department", "Date", "Time", "Status"), 18
+    )
+    tree.pack(fill="both", expand=True, padx=20, pady=15)
+
+    def validate_date():
+        selected_date = date_entry.get().strip()
+        try:
+            datetime.strptime(selected_date, "%Y-%m-%d")
+            return selected_date
+        except ValueError:
+            messagebox.showerror(
+                "Invalid Date", "Enter date in YYYY-MM-DD format."
+            )
+            return None
+
+    def clear_tree():
+        tree.delete(*tree.get_children())
+
+    def load_report():
+        selected_date = validate_date()
+        if not selected_date:
+            return
+
+        clear_tree()
+        with connect_db() as conn:
+            rows = conn.execute("""
+                SELECT students.name,students.department,
+                       attendance.attendance_date,
+                       attendance.attendance_time,attendance.status
+                FROM attendance
+                JOIN students ON students.id=attendance.student_id
+                WHERE attendance.attendance_date=?
+                ORDER BY students.name
+            """, (selected_date,)).fetchall()
+
+        for row in rows:
+            tree.insert("", "end", values=row)
+
+    def show_absent_students():
+        selected_date = validate_date()
+        if not selected_date:
+            return
+
+        clear_tree()
+        with connect_db() as conn:
+            rows = conn.execute("""
+                SELECT name,department FROM students
+                WHERE id NOT IN (
+                    SELECT student_id FROM attendance
+                    WHERE attendance_date=?
+                )
+                ORDER BY name
+            """, (selected_date,)).fetchall()
+
+        for name, department in rows:
+            tree.insert(
+                "", "end",
+                values=(name, department, selected_date, "-", "Absent")
+            )
+
+    def show_monthly_report():
+        selected_date = validate_date()
+        if not selected_date:
+            return
+
+        month = selected_date[:7]
+        clear_tree()
+
+        with connect_db() as conn:
+            rows = conn.execute("""
+                SELECT students.name,students.department,
+                       attendance.attendance_date,
+                       attendance.attendance_time,attendance.status
+                FROM attendance
+                JOIN students ON students.id=attendance.student_id
+                WHERE attendance.attendance_date LIKE ?
+                ORDER BY attendance.attendance_date DESC
+            """, (month + "%",)).fetchall()
+
+        for row in rows:
+            tree.insert("", "end", values=row)
+
+    buttons = tk.Frame(root, bg=BG)
+    buttons.pack(pady=10)
+
+    for text, command, color in [
+        ("Search Date", load_report, BLUE),
+        ("Absent Report", show_absent_students, RED),
+        ("Monthly Report", show_monthly_report, ORANGE),
+        ("Back", show_dashboard, DARK)
+    ]:
+        make_button(buttons, text, command, color).pack(side="left", padx=5)
+
+    load_report()
+
+# ================= CSV / PDF EXPORT =================
+
+def export_report():
+    file_path = filedialog.asksaveasfilename(
+        title="Export Attendance Report",
+        defaultextension=".csv",
+        filetypes=[("CSV File", "*.csv"), ("PDF File", "*.pdf")]
+    )
+    if not file_path:
+        return
+
+    with connect_db() as conn:
+        rows = conn.execute("""
+            SELECT students.id,students.name,students.department,
+                   students.year,attendance.attendance_date,
+                   attendance.attendance_time,attendance.status
+            FROM attendance
+            JOIN students ON students.id=attendance.student_id
+            ORDER BY attendance.attendance_date DESC
+        """).fetchall()
+
+    headers = [
+        "Student ID", "Name", "Department", "Year",
+        "Date", "Time", "Status"
+    ]
+
+    try:
+        if file_path.lower().endswith(".pdf"):
+            pdf = canvas.Canvas(file_path, pagesize=A4)
+            width, height = A4
+            pdf.setFont("Helvetica-Bold", 16)
+            pdf.drawString(40, height-40, "FaceTrack Attendance Report")
+
+            pdf.setFont("Helvetica-Bold", 8)
+            y = height - 75
+            pdf.drawString(
+                40, y, "ID | Name | Department | Year | Date | Time | Status"
+            )
+            y -= 20
+            pdf.setFont("Helvetica", 8)
+
+            for row in rows:
+                line = " | ".join(str(value or "") for value in row)
+                if y < 50:
+                    pdf.showPage()
+                    pdf.setFont("Helvetica", 8)
+                    y = height - 50
+
+                pdf.drawString(40, y, line[:115])
+                y -= 15
+
+            pdf.save()
+
+        else:
+            with open(file_path, "w", newline="", encoding="utf-8") as file:
+                writer = csv.writer(file)
+                writer.writerow(headers)
+                writer.writerows(rows)
+
+        audit("REPORT_EXPORTED", file_path)
+        messagebox.showinfo(
+            "Export Complete", f"Report saved successfully:\n{file_path}"
+        )
+
+    except Exception as error:
+        messagebox.showerror("Export Error", str(error))
+
+# ================= DATABASE BACKUP =================
+
+def backup_database():
+    """Export MySQL table definitions and rows to a .sql backup file."""
+    backup_name = "facetrack_backup_" + datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    ) + ".sql"
+    backup_path = os.path.join(BACKUP_DIR, backup_name)
+    connection = None
+
+    try:
+        connection = mysql.connector.connect(**DB_CONFIG)
+        cursor = connection.cursor()
+        tables = ["students", "attendance", "admins", "audit_log"]
+
+        with open(backup_path, "w", encoding="utf-8") as file:
+            file.write("CREATE DATABASE IF NOT EXISTS facetrack;\nUSE facetrack;\n\n")
+            file.write("SET FOREIGN_KEY_CHECKS=0;\n")
+            for table in tables:
+                cursor.execute(f"SHOW CREATE TABLE `{table}`")
+                create_row = cursor.fetchone()
+                file.write("\nDROP TABLE IF EXISTS `" + table + "`;\n")
+                file.write(create_row[1] + ";\n")
+
+                cursor.execute(f"SELECT * FROM `{table}`")
+                rows = cursor.fetchall()
+                for row in rows:
+                    values = []
+                    for value in row:
+                        if value is None:
+                            values.append("NULL")
+                        elif isinstance(value, (int, float)):
+                            values.append(str(value))
+                        elif isinstance(value, (datetime, date)):
+                            values.append("'" + value.isoformat() + "'")
+                        else:
+                            escaped = str(value).replace("\\", "\\\\").replace("'", "\\'")
+                            values.append("'" + escaped + "'")
+                    file.write(
+                        f"INSERT INTO `{table}` VALUES ({', '.join(values)});\n"
+                    )
+            file.write("\nSET FOREIGN_KEY_CHECKS=1;\n")
+
+        audit("DATABASE_BACKUP", backup_path)
+        messagebox.showinfo(
+            "Backup Complete", f"MySQL backup created:\n{backup_path}"
+        )
+    except Exception as error:
+        messagebox.showerror("Backup Error", str(error))
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+
+# ================= CHANGE PASSWORD =================
+
+def change_password():
+    win = tk.Toplevel(root)
+    win.title("Change Admin Password")
+    win.geometry("400x300")
+    win.configure(bg=WHITE)
+
+    make_label(win, "Change Admin Password", 15, True, DARK).pack(pady=15)
+
+    make_label(win, "Current Password").pack()
+    current_entry = tk.Entry(win, show="*", width=30)
+    current_entry.pack(pady=5)
+
+    make_label(win, "New Password").pack()
+    new_entry = tk.Entry(win, show="*", width=30)
+    new_entry.pack(pady=5)
+
+    def save_password():
+        current = current_entry.get()
+        new = new_entry.get()
+
+        if len(new) < 6:
+            messagebox.showwarning(
+                "Weak Password", "New password must contain at least 6 characters."
+            )
+            return
+
+        with connect_db() as conn:
+            result = conn.execute("""
+                SELECT id FROM admins
+                WHERE username=? AND password=?
+            """, (current_user, hash_password(current))).fetchone()
+
+            if not result:
+                messagebox.showerror(
+                    "Incorrect Password", "Current password is incorrect."
+                )
+                return
+
+            conn.execute(
+                "UPDATE admins SET password=? WHERE username=?",
+                (hash_password(new), current_user)
+            )
+
+        audit("PASSWORD_CHANGED", current_user)
+        win.destroy()
+        messagebox.showinfo(
+            "Password Changed", "Admin password updated successfully."
+        )
+
+    make_button(win, "UPDATE PASSWORD", save_password, GREEN).pack(pady=15)
+
+# ================= START APPLICATION =================
+
+try:
+    initialize_database()
+except mysql.connector.Error as error:
+    root.withdraw()
+    messagebox.showerror(
+        "MySQL Connection Error",
+        "Unable to connect to the facetrack MySQL database.\n\n"
+        "Check that MySQL Server is running, the database 'facetrack' exists, "
+        "and DB_CONFIG has the correct password.\n\n"
+        f"Details: {error}"
+    )
+    root.destroy()
+    raise SystemExit(1)
+
+show_login()
+root.mainloop()
+
+
+
+SQL CODE
+CREATE DATABASE facetrack;
+
+USE facetrack;
+
+CREATE TABLE students (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    department VARCHAR(100),
+    year VARCHAR(30),
+    face_id VARCHAR(100) UNIQUE,
+    photo_path TEXT,
+    created_at DATETIME
+);
+
+CREATE TABLE attendance (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    student_id INT,
+    attendance_date DATE,
+    attendance_time TIME,
+    status VARCHAR(20) DEFAULT 'Present',
+
+    FOREIGN KEY (student_id)
+    REFERENCES students(id),
+
+    UNIQUE(student_id, attendance_date)
+);
+
+CREATE TABLE admins (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE,
+    password VARCHAR(255)
+);
+
+
+CREATE TABLE audit_log (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    action VARCHAR(100),
+    details TEXT,
+    log_time DATETIME
+);
+
+SHOW TABLES;
+
+SELECT * FROM students;
+SELECT * FROM attendance;
+SELECT * FROM admins;
+SELECT * FROM audit_log;
